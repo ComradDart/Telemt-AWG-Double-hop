@@ -25,13 +25,18 @@ SECRETS_FILE="$STATE_DIR/secrets.env"    # сгенерированные сек
 PANEL_INFO_FILE="/root/panel_path.txt"   # итоговая памятка для пользователя
 CF_CREDS_FILE="/root/.secrets/cloudflare.ini"  # API-токен Cloudflare для DNS-01
 
-WG_DIR="/opt/wg-easy"                    # docker-compose панели
+WG_DIR="/opt/wg-easy"                    # docker-compose стека (wg-easy + nginx)
 WG_IMAGE="ghcr.io/wg-easy/wg-easy:15"
-WG_UI_PORT="51821"                       # порт веб-интерфейса (только 127.0.0.1)
+NGINX_IMAGE="nginx:stable"
+WG_UI_PORT="51821"                       # порт веб-интерфейса панели (внутри docker-сети)
 
-STUB_DIR="/var/www/stub"                 # сайт-заглушка
-SSL_DIR="/etc/nginx/ssl"
-NGINX_SITE="/etc/nginx/sites-available/vpn-panel"
+# Ассеты nginx на хосте (монтируются в контейнер). Слева — путь на ХОСТЕ,
+# справа в комментарии — путь ВНУТРИ контейнера, который пишется в конфиг.
+NGINX_DIR="$WG_DIR/nginx"
+STUB_DIR="$NGINX_DIR/stub"               # в контейнере: /var/www/stub
+SSL_DIR="$NGINX_DIR/ssl"                 # в контейнере: /etc/nginx/ssl
+NGINX_CONF="$NGINX_DIR/conf.d/default.conf"  # в контейнере: /etc/nginx/conf.d/default.conf
+
 SSHD_DROPIN="/etc/ssh/sshd_config.d/99-vps-setup.conf"
 
 AMNEZIA_KEY_FPR="75C9DD72C799870E310542E24166F2C257290828"
@@ -475,16 +480,16 @@ EOF
 log "Секретный путь панели: /$PANEL_PATH"
 
 # ==============================================================================
-# ШАГ 9. Панель wg-easy (Docker, режим AmneziaWG)
+# ШАГ 9. Стек wg-easy + nginx: .env и docker-compose
 # ==============================================================================
-log "--- Шаг 9: панель wg-easy ---"
+log "--- Шаг 9: подготовка стека (.env + docker-compose) ---"
 
-mkdir -p "$WG_DIR"
+mkdir -p "$WG_DIR" "$NGINX_DIR/conf.d" "$STUB_DIR" "$SSL_DIR"
 chmod 700 "$WG_DIR"
 
-WG_CHANGED=0
+STACK_CHANGED=0
 
-# Переменные (включая пароль) держим в .env с правами 600
+# Переменные стека (включая пароль) держим в .env с правами 600
 if deploy_file "$WG_DIR/.env" 600 <<EOF
 WG_PORT=$WG_PORT
 INIT_HOST=$SERVER_HOST
@@ -492,13 +497,16 @@ ADMIN_USERNAME=$ADMIN_USER
 ADMIN_PASSWORD=$ADMIN_PASSWORD
 EOF
 then
-    WG_CHANGED=1
+    STACK_CHANGED=1
 fi
 
-# Compose-файл по официальной документации wg-easy v15:
-#  - EXPERIMENTAL_AWG=true: поддержка AmneziaWG (модуль ядра определяется автоматически)
-#  - INSECURE=true: TLS терминирует nginx, панель слушает http только на 127.0.0.1
-#  - INIT_*: автоматическая первичная настройка (применяется только при ПЕРВОМ запуске)
+# Единый docker-compose: wg-easy + nginx в общей сети wg.
+#  - Панель НЕ публикуется на хост — nginx ходит к ней по имени сервиса
+#    (wg-easy:51821) внутри docker-сети; наружу торчат только 80/443 и WG/udp.
+#  - EXPERIMENTAL_AWG=true: поддержка AmneziaWG (модуль ядра определяется автоматически).
+#  - INSECURE=true: TLS терминирует nginx, к панели идёт http по внутренней сети.
+#  - INIT_*: первичная настройка (применяется только при ПЕРВОМ запуске).
+#  - Конфиг/заглушка/ssl монтируются из ./nginx, /etc/letsencrypt — на чтение.
 if deploy_file "$WG_DIR/docker-compose.yml" 600 <<'EOF'
 volumes:
   etc_wireguard:
@@ -524,7 +532,6 @@ services:
       - /lib/modules:/lib/modules:ro
     ports:
       - "${WG_PORT}:${WG_PORT}/udp"
-      - "127.0.0.1:51821:51821/tcp"
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
@@ -535,6 +542,23 @@ services:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv6.conf.all.forwarding=1
       - net.ipv6.conf.default.forwarding=1
+
+  nginx:
+    image: nginx:stable
+    container_name: wg-nginx
+    depends_on:
+      - wg-easy
+    networks:
+      - wg
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/stub:/var/www/stub:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    restart: unless-stopped
 
 networks:
   wg:
@@ -547,42 +571,17 @@ networks:
         - subnet: fdcc:ad94:bacf:61a3::/64
 EOF
 then
-    WG_CHANGED=1
-fi
-
-WG_RUNNING=$(docker inspect -f '{{.State.Running}}' wg-easy 2>/dev/null || echo "false")
-if [[ "$WG_RUNNING" == "true" ]] && (( WG_CHANGED == 0 )); then
-    skip "Контейнер wg-easy уже запущен, конфигурация не менялась"
-else
-    log "Запускаю wg-easy (docker compose up -d)"
-    (cd "$WG_DIR" && docker compose up -d)
-fi
-
-# Ждём, пока веб-интерфейс начнёт отвечать
-log "Жду ответа панели на 127.0.0.1:$WG_UI_PORT ..."
-PANEL_UP=0
-for _ in $(seq 1 30); do
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WG_UI_PORT/" || true)
-    if [[ "$HTTP_CODE" != "000" ]]; then
-        PANEL_UP=1
-        break
-    fi
-    sleep 2
-done
-if (( PANEL_UP )); then
-    log "Панель wg-easy отвечает (HTTP $HTTP_CODE)"
-else
-    warn "Панель не ответила за 60 секунд. Проверьте: docker logs wg-easy"
+    STACK_CHANGED=1
 fi
 
 # ==============================================================================
-# ШАГ 10. Nginx: заглушка + reverse-proxy по секретному пути + TLS
+# ШАГ 10. Конфигурация nginx, запуск стека и TLS-сертификат
 # ==============================================================================
-log "--- Шаг 10: nginx + TLS-сертификат ---"
+log "--- Шаг 10: nginx, запуск стека и TLS ---"
 
-apt_install nginx
-
-NGINX_CHANGED=0
+# Управление nginx внутри контейнера
+nginx_test()   { docker exec wg-nginx nginx -t; }
+nginx_reload() { docker exec wg-nginx nginx -s reload; }
 
 # IPv6-listen добавляем, только если IPv6 включён в системе
 LISTEN6_80=""
@@ -592,17 +591,10 @@ if [[ -f /proc/net/if_inet6 ]]; then
     LISTEN6_443="listen [::]:443 ssl default_server;"
 fi
 
-# Перезагрузка nginx с проверкой конфигурации
-reload_nginx() {
-    nginx -t || die "Ошибка в конфигурации nginx — проверьте $NGINX_SITE"
-    systemctl enable nginx >/dev/null 2>&1
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
-}
-
-# Рендер конфигурации сайта. $1 — путь к сертификату, $2 — путь к ключу.
+# Рендер конфигурации nginx. $1/$2 — пути к сертификату/ключу ВНУТРИ контейнера.
 # Схема доступа к панели:
 #   GET /<секретный_путь>  -> ставится HttpOnly-cookie + redirect на /
-#   запросы с верной cookie -> proxy_pass на панель wg-easy (127.0.0.1:51821)
+#   запросы с верной cookie -> proxy_pass на панель (wg-easy:51821 по docker-сети)
 #   все остальные запросы   -> статическая заглушка
 # (wg-easy — SPA с абсолютными путями /api, /_nuxt — поэтому cookie-схема,
 #  а не проксирование подпути, которое сломало бы интерфейс панели)
@@ -633,7 +625,7 @@ server {
 
     # Каталог для HTTP-01 проверки Let's Encrypt
     location ^~ /.well-known/acme-challenge/ {
-        root @STUB_DIR@;
+        root /var/www/stub;
         default_type "text/plain";
         try_files $uri =404;
     }
@@ -644,7 +636,7 @@ server {
     }
 
     location / {
-        root @STUB_DIR@;
+        root /var/www/stub;
         index index.html;
         try_files $uri $uri/ =404;
     }
@@ -673,13 +665,13 @@ server {
         if ($panel_granted) {
             return 418;
         }
-        root @STUB_DIR@;
+        root /var/www/stub;
         index index.html;
         try_files $uri $uri/ =404;
     }
 
     location @panel {
-        proxy_pass http://127.0.0.1:@WG_UI_PORT@;
+        proxy_pass http://wg-easy:@WG_UI_PORT@;
         proxy_http_version 1.1;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
@@ -693,15 +685,14 @@ EOF
     sed -i \
         -e "s|@PANEL_PATH@|$PANEL_PATH|g" \
         -e "s|@COOKIE_TOKEN@|$COOKIE_TOKEN|g" \
-        -e "s|@STUB_DIR@|$STUB_DIR|g" \
         -e "s|@SSL_CRT@|$crt|g" \
         -e "s|@SSL_KEY@|$key|g" \
         -e "s|@WG_UI_PORT@|$WG_UI_PORT|g" \
         -e "s|@LISTEN6_80@|$LISTEN6_80|g" \
         -e "s|@LISTEN6_443@|$LISTEN6_443|g" \
         "$tmp"
-    if deploy_file "$NGINX_SITE" 644 < "$tmp"; then
-        NGINX_CHANGED=1
+    if deploy_file "$NGINX_CONF" 644 < "$tmp"; then
+        STACK_CHANGED=1
     fi
     rm -f "$tmp"
 }
@@ -733,11 +724,10 @@ if deploy_file "$STUB_DIR/index.html" 644 <<'EOF'
 </html>
 EOF
 then
-    NGINX_CHANGED=1
+    STACK_CHANGED=1
 fi
 
-# --- Самоподписанный сертификат (всегда — как fallback и для первого старта) ---
-mkdir -p "$SSL_DIR"
+# --- Самоподписанный сертификат (bootstrap: nginx должен стартовать до certbot) ---
 if [[ -s "$SSL_DIR/selfsigned.crt" && -s "$SSL_DIR/selfsigned.key" ]]; then
     skip "Самоподписанный сертификат уже существует"
 else
@@ -751,12 +741,13 @@ else
         -keyout "$SSL_DIR/selfsigned.key" -out "$SSL_DIR/selfsigned.crt" \
         -subj "/CN=$SERVER_HOST" -addext "subjectAltName=$SAN"
     chmod 600 "$SSL_DIR/selfsigned.key"
+    STACK_CHANGED=1
 fi
 
-# --- Выбор итогового сертификата ---
-LE_LIVE="/etc/letsencrypt/live/$SERVER_HOST"
-CERT_CRT="$SSL_DIR/selfsigned.crt"
-CERT_KEY="$SSL_DIR/selfsigned.key"
+# --- Выбор итогового сертификата (пути ВНУТРИ контейнера) ---
+LE_LIVE="/etc/letsencrypt/live/$SERVER_HOST"   # путь одинаков на хосте и в контейнере
+CERT_CRT="/etc/nginx/ssl/selfsigned.crt"
+CERT_KEY="/etc/nginx/ssl/selfsigned.key"
 CERT_DESC="самоподписанный (браузер покажет предупреждение)"
 
 # Если сертификат Let's Encrypt уже выпущен — используем его сразу
@@ -766,23 +757,41 @@ if [[ "$CERT_MODE" != "1" && -s "$LE_LIVE/fullchain.pem" ]]; then
     CERT_DESC="Let's Encrypt"
     skip "Сертификат Let's Encrypt для $SERVER_HOST уже выпущен"
 fi
-
-# Первый рендер + включение сайта (nginx должен работать для HTTP-01 webroot)
 render_nginx "$CERT_CRT" "$CERT_KEY"
-if [[ ! -L /etc/nginx/sites-enabled/vpn-panel ]]; then
-    ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/vpn-panel
-    NGINX_CHANGED=1
-fi
-if [[ -e /etc/nginx/sites-enabled/default ]]; then
-    log "Отключаю дефолтный сайт nginx"
-    rm -f /etc/nginx/sites-enabled/default
-    NGINX_CHANGED=1
-fi
-if (( NGINX_CHANGED )); then
-    reload_nginx
-    log "Nginx настроен (сертификат: $CERT_DESC)"
+
+# --- Запуск/обновление стека ---
+NGINX_RUNNING=$(docker inspect -f '{{.State.Running}}' wg-nginx 2>/dev/null || echo "false")
+WG_RUNNING=$(docker inspect -f '{{.State.Running}}' wg-easy 2>/dev/null || echo "false")
+if (( STACK_CHANGED )) || [[ "$NGINX_RUNNING" != "true" || "$WG_RUNNING" != "true" ]]; then
+    log "Запускаю стек (docker compose up -d)"
+    (cd "$WG_DIR" && docker compose up -d)
 else
-    skip "Конфигурация nginx уже актуальна"
+    skip "Стек уже запущен, конфигурация не менялась"
+fi
+
+# Ждём, пока nginx начнёт отвечать на 443
+log "Жду запуска nginx на https://127.0.0.1 ..."
+NGINX_UP=0
+for _ in $(seq 1 30); do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1/" || true)
+    if [[ "$code" != "000" ]]; then NGINX_UP=1; break; fi
+    sleep 2
+done
+if (( NGINX_UP )); then
+    log "Nginx отвечает (HTTP $code)"
+else
+    warn "Nginx не ответил за 60 секунд. Проверьте: docker logs wg-nginx; docker logs wg-easy"
+fi
+
+# Применяем изменения конфига к уже работающему nginx (docker не перечитывает
+# смонтированный конфиг при правке — нужен reload)
+if (( STACK_CHANGED )) && [[ "$(docker inspect -f '{{.State.Running}}' wg-nginx 2>/dev/null || echo false)" == "true" ]]; then
+    if nginx_test; then
+        nginx_reload
+        log "Конфигурация nginx применена (сертификат: $CERT_DESC)"
+    else
+        die "Ошибка конфигурации nginx — проверьте $NGINX_CONF (docker exec wg-nginx nginx -t)"
+    fi
 fi
 
 # --- Выпуск сертификата Let's Encrypt, если запрошен и ещё не выпущен ---
@@ -791,7 +800,7 @@ if [[ "$CERT_MODE" != "1" && ! -s "$LE_LIVE/fullchain.pem" ]]; then
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
     deploy_file /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh 755 <<'EOF' >/dev/null || true
 #!/bin/sh
-systemctl reload nginx
+docker exec wg-nginx nginx -s reload
 EOF
 
     if [[ "$CERT_MODE" == "2" ]]; then
@@ -824,13 +833,15 @@ EOF
 
     # Если сертификат появился — переключаем nginx на него
     if [[ -s "$LE_LIVE/fullchain.pem" ]]; then
-        CERT_CRT="$LE_LIVE/fullchain.pem"
-        CERT_KEY="$LE_LIVE/privkey.pem"
         CERT_DESC="Let's Encrypt"
-        NGINX_CHANGED=0
-        render_nginx "$CERT_CRT" "$CERT_KEY"
-        reload_nginx
-        log "Nginx переключён на сертификат Let's Encrypt (автопродление — systemd-таймер certbot)"
+        STACK_CHANGED=0
+        render_nginx "$LE_LIVE/fullchain.pem" "$LE_LIVE/privkey.pem"
+        if nginx_test; then
+            nginx_reload
+            log "Nginx переключён на сертификат Let's Encrypt (автопродление — systemd-таймер certbot, hook перезагружает контейнер)"
+        else
+            die "Ошибка конфигурации nginx после переключения на LE — проверьте $NGINX_CONF"
+        fi
     fi
 fi
 
