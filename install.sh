@@ -1334,8 +1334,9 @@ if ! grep -qi 'PersistentKeepalive' "$AWG_CONF_DIR/$AWG_IFACE.conf"; then
     sed -i '/^\[Peer\]/a PersistentKeepalive = 25' "$AWG_CONF_DIR/$AWG_IFACE.conf"
 fi
 
-awg-quick down "$AWG_IFACE" 2>/dev/null || true
-awg-quick up "$AWG_IFACE" || die "Не удалось поднять $AWG_IFACE — проверьте конфиг и доступность outbound по UDP."
+# Поднимаем по ПОЛНОМУ пути к конфигу (не зависим от дефолтного каталога awg-quick)
+awg-quick down "$AWG_CONF_DIR/$AWG_IFACE.conf" 2>/dev/null || true
+awg-quick up "$AWG_CONF_DIR/$AWG_IFACE.conf" || die "Не удалось поднять $AWG_IFACE — проверьте конфиг и доступность outbound по UDP."
 systemctl enable "awg-quick@$AWG_IFACE" >/dev/null 2>&1 || true
 
 if timeout 5 bash -c "exec 3<>/dev/tcp/$OUTBOUND_WG_IP/$TELEMT_PORT" 2>/dev/null; then
