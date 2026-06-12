@@ -1,0 +1,4 @@
+# Shell-скрипты всегда с LF — иначе не запустятся на Linux
+*.sh text eol=lf
+install.sh text eol=lf
+* text=auto
