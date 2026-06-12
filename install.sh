@@ -884,6 +884,7 @@ EOF
     network_mode: "service:wg-easy"
     volumes:
       - ./telemt-panel/config.toml:/etc/telemt-panel/config.toml:ro
+      - ./telemt:/etc/telemt:rw
     restart: unless-stopped
 EOF
     fi
