@@ -705,20 +705,145 @@ if deploy_file "$STUB_DIR/index.html" 644 <<'EOF'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Welcome</title>
+<title>Northwind Studio — Digital Product Design</title>
+<meta name="description" content="Northwind Studio is a small independent team designing and building thoughtful digital products.">
 <style>
-  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-       display:flex;align-items:center;justify-content:center;min-height:100vh;
-       background:#f5f6f8;color:#333}
-  .card{text-align:center;padding:48px}
-  h1{font-size:28px;font-weight:600;margin:0 0 12px}
-  p{color:#777;margin:0}
+  :root{
+    --bg:#0f1115; --panel:#161922; --ink:#eef1f6; --muted:#9aa3b2;
+    --line:#262b36; --brand:#5b8def; --brand-2:#7c5cff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--ink); line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  header{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:22px 0;border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex;align-items:center;gap:12px;font-weight:650;letter-spacing:.2px}
+  .brand svg{display:block}
+  nav a{color:var(--muted);margin-left:26px;font-size:15px;transition:color .15s}
+  nav a:hover{color:var(--ink)}
+  .nav-cta{
+    color:var(--ink)!important;border:1px solid var(--line);
+    padding:8px 16px;border-radius:9px;
+  }
+  .nav-cta:hover{border-color:var(--brand)}
+  .hero{padding:96px 0 80px;text-align:center}
+  .eyebrow{
+    display:inline-block;color:var(--brand);font-size:13px;font-weight:600;
+    letter-spacing:1.4px;text-transform:uppercase;margin-bottom:18px;
+  }
+  .hero h1{
+    font-size:52px;line-height:1.1;margin:0 0 20px;font-weight:720;
+    letter-spacing:-.5px;
+  }
+  .hero h1 span{
+    background:linear-gradient(90deg,var(--brand),var(--brand-2));
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .hero p{font-size:19px;color:var(--muted);max-width:620px;margin:0 auto 34px}
+  .btns{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+  .btn{
+    padding:13px 26px;border-radius:11px;font-weight:600;font-size:15px;
+    border:1px solid transparent;transition:transform .12s,opacity .15s;
+  }
+  .btn:hover{transform:translateY(-1px)}
+  .btn-primary{background:linear-gradient(90deg,var(--brand),var(--brand-2));color:#fff}
+  .btn-ghost{border-color:var(--line);color:var(--ink)}
+  .btn-ghost:hover{border-color:var(--brand)}
+  .grid{
+    display:grid;grid-template-columns:repeat(3,1fr);gap:20px;
+    padding:24px 0 96px;
+  }
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:16px;
+    padding:28px;transition:border-color .15s,transform .15s;
+  }
+  .card:hover{border-color:#34405a;transform:translateY(-2px)}
+  .card .ic{
+    width:42px;height:42px;border-radius:11px;display:flex;align-items:center;
+    justify-content:center;background:rgba(91,141,239,.12);margin-bottom:18px;
+  }
+  .card h3{margin:0 0 8px;font-size:18px}
+  .card p{margin:0;color:var(--muted);font-size:15px}
+  footer{
+    border-top:1px solid var(--line);padding:30px 0;
+    display:flex;align-items:center;justify-content:space-between;
+    color:var(--muted);font-size:14px;flex-wrap:wrap;gap:12px;
+  }
+  @media(max-width:780px){
+    .hero{padding:64px 0 48px}
+    .hero h1{font-size:38px}
+    .grid{grid-template-columns:1fr;padding-bottom:64px}
+    nav a:not(.nav-cta){display:none}
+  }
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>This site is under construction</h1>
-  <p>Please check back later.</p>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="28" height="28" rx="8" fill="url(#g)"/>
+        <path d="M8 19V9l6 7 6-7v10" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <defs><linearGradient id="g" x1="0" y1="0" x2="28" y2="28">
+          <stop stop-color="#5b8def"/><stop offset="1" stop-color="#7c5cff"/>
+        </linearGradient></defs>
+      </svg>
+      <span>Northwind Studio</span>
+    </div>
+    <nav>
+      <a href="#work">Work</a>
+      <a href="#services">Services</a>
+      <a href="#contact" class="nav-cta">Contact</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <span class="eyebrow">Independent Design &amp; Engineering</span>
+    <h1>We build <span>calm, careful</span><br>digital products.</h1>
+    <p>Northwind is a small studio partnering with founders and teams to design,
+       prototype and ship software that feels effortless to use.</p>
+    <div class="btns">
+      <a href="#contact" class="btn btn-primary">Start a project</a>
+      <a href="#work" class="btn btn-ghost">See our work</a>
+    </div>
+  </section>
+
+  <section class="grid" id="services">
+    <div class="card">
+      <div class="ic">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5b8def" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg>
+      </div>
+      <h3>Product Design</h3>
+      <p>Research, interface design and design systems that scale with your team.</p>
+    </div>
+    <div class="card">
+      <div class="ic">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5b8def" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6 2 12l6 6M16 6l6 6-6 6"/></svg>
+      </div>
+      <h3>Web Engineering</h3>
+      <p>Fast, accessible and maintainable front-ends built on modern tooling.</p>
+    </div>
+    <div class="card">
+      <div class="ic">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5b8def" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v6m0 8v6M2 12h6m8 0h6"/><circle cx="12" cy="12" r="3"/></svg>
+      </div>
+      <h3>Strategy</h3>
+      <p>From positioning to roadmap, we help you decide what to build next.</p>
+    </div>
+  </section>
+
+  <footer>
+    <span>&copy; Northwind Studio</span>
+    <span id="contact">hello@northwind.studio</span>
+  </footer>
 </div>
 </body>
 </html>
@@ -758,6 +883,16 @@ if [[ "$CERT_MODE" != "1" && -s "$LE_LIVE/fullchain.pem" ]]; then
     skip "Сертификат Let's Encrypt для $SERVER_HOST уже выпущен"
 fi
 render_nginx "$CERT_CRT" "$CERT_KEY"
+
+# --- Освобождаем 80/443 от системного nginx (мог остаться от старой версии скрипта) ---
+# Раньше nginx ставился на хост; теперь его роль выполняет контейнер wg-nginx.
+# Иначе host-nginx удержит порты 80/443 и контейнер не сможет их забиндить.
+if dpkg -s nginx >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep -q '^nginx\.service'; then
+    if systemctl is-enabled --quiet nginx 2>/dev/null || systemctl is-active --quiet nginx 2>/dev/null; then
+        warn "Обнаружен системный nginx на хосте — останавливаю и отключаю (порты 80/443 займёт контейнер wg-nginx)"
+        systemctl disable --now nginx 2>/dev/null || true
+    fi
+fi
 
 # --- Запуск/обновление стека ---
 NGINX_RUNNING=$(docker inspect -f '{{.State.Running}}' wg-nginx 2>/dev/null || echo "false")
