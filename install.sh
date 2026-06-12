@@ -1200,9 +1200,11 @@ if [[ "$ENABLE_TELEMT" == "yes" ]]; then
     [[ -n "$WG_TUN_IP" ]] || die "Не удалось определить WG-IP внутри wg-easy (docker exec wg-easy ip addr)."
     log "WG-IP туннеля (на нём слушает telemt): $WG_TUN_IP"
 
-    # 2. Конфиг telemt (монтируется директорией; рабочая папка — tmpfs из compose)
+    # 2. Конфиг telemt (монтируется директорией; рабочая папка — tmpfs из compose).
+    # Права 644: контейнер telemt работает под non-root и должен прочитать конфиг;
+    # каталог /opt/wg-easy остаётся 700, так что обычные юзеры хоста файл не видят.
     mkdir -p "$TELEMT_DIR"
-    deploy_file "$TELEMT_DIR/config.toml" 600 <<EOF >/dev/null || true
+    deploy_file "$TELEMT_DIR/config.toml" 644 <<EOF >/dev/null || true
 [general]
 fast_mode        = true
 use_middle_proxy = true
