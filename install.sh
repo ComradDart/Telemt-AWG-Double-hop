@@ -612,6 +612,9 @@ render_nginx() {
     cat > "$tmp" <<'EOF'
 # Создано vps_setup.sh — не редактируйте вручную, файл перезаписывается
 
+# токен cookie длиной 64 символа не влезает в дефолтный бакет (64)
+map_hash_bucket_size 128;
+
 map $cookie_sid $panel_granted {
     default 0;
     "@COOKIE_TOKEN@" 1;
