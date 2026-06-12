@@ -1,0 +1,6 @@
+# локальные секреты/состояние, если кто-то тестирует рядом
+*.log
+secrets.env
+answers.env
+panel_path.txt
+*.swp
