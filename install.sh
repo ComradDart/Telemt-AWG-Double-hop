@@ -114,6 +114,9 @@ deploy_file() {
     return 0
 }
 
+# Похоже на домен/IP (только латиница/цифры/.:-_) — отсекает ввод в кириллице.
+is_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]; }
+
 # Развернуть статическую заглушку (index.html) в каталог $1.
 # Возвращает 0, если файл изменился (как deploy_file).
 deploy_stub() {
@@ -350,8 +353,8 @@ while true; do
     else
         read -rp "Публичный IP или домен ЭТОГО сервера: " SERVER_HOST
     fi
-    [[ -n "$SERVER_HOST" ]] && break
-    echo "  Значение не может быть пустым."
+    [[ -n "$SERVER_HOST" ]] && is_host "$SERVER_HOST" && break
+    echo "  Похоже на опечатку или кириллицу. Допустимы латиница, цифры, точки, дефис."
 done
 
 # --- Способ получения TLS-сертификата ---
@@ -411,11 +414,15 @@ if [[ "$ROLE" == "outbound" ]]; then
         while true; do
             read -rp "Публичный IP/домен INBOUND-сервера (точка входа в РФ) [${INBOUND_ADDR}]: " v
             INBOUND_ADDR="${v:-$INBOUND_ADDR}"
-            [[ -n "$INBOUND_ADDR" ]] && break
-            echo "  Нужен адрес inbound — он попадёт в ссылки Telegram (telemt public_host)."
+            [[ -n "$INBOUND_ADDR" ]] && is_host "$INBOUND_ADDR" && break
+            echo "  Нужен корректный адрес inbound (латиница/цифры/точки) — он идёт в ссылки Telegram."
         done
-        read -rp "Маска fake-TLS для Telegram (чужой популярный домен, НЕ ваш) [${TELEMT_TLS_DOMAIN}]: " v
-        TELEMT_TLS_DOMAIN="${v:-$TELEMT_TLS_DOMAIN}"
+        while true; do
+            read -rp "Маска fake-TLS для Telegram (чужой популярный домен, НЕ ваш) [${TELEMT_TLS_DOMAIN}]: " v
+            v="${v:-$TELEMT_TLS_DOMAIN}"
+            is_host "$v" && { TELEMT_TLS_DOMAIN="$v"; break; }
+            echo "  Похоже на кириллицу/опечатку — домен из латиницы, например www.microsoft.com"
+        done
         read -rp "Порт telemt внутри туннеля [${TELEMT_PORT}]: " v
         TELEMT_PORT="${v:-$TELEMT_PORT}"
         log "telemt включён: вход=$INBOUND_ADDR, маска=$TELEMT_TLS_DOMAIN, порт=$TELEMT_PORT (панель ставится)"
@@ -424,8 +431,12 @@ else
     # inbound: параметры берутся из печати outbound-скрипта
     echo ""
     echo "Параметры для подключения к OUTBOUND (их напечатал outbound-скрипт в конце):"
-    read -rp "Маска fake-TLS Telegram (как на outbound) [${TELEMT_TLS_DOMAIN}]: " v
-    TELEMT_TLS_DOMAIN="${v:-$TELEMT_TLS_DOMAIN}"
+    while true; do
+        read -rp "Маска fake-TLS Telegram (как на outbound) [${TELEMT_TLS_DOMAIN}]: " v
+        v="${v:-$TELEMT_TLS_DOMAIN}"
+        is_host "$v" && { TELEMT_TLS_DOMAIN="$v"; break; }
+        echo "  Похоже на кириллицу/опечатку — домен из латиницы."
+    done
     while true; do
         read -rp "WG-IP telemt на outbound (например 10.8.0.1) [${OUTBOUND_WG_IP}]: " v
         OUTBOUND_WG_IP="${v:-$OUTBOUND_WG_IP}"
@@ -441,10 +452,11 @@ else
         echo ""
         echo "Вставьте AmneziaWG-конфиг клиента целиком."
         echo "  (в панели wg-easy на outbound: New Client → скачать .conf, открыть, скопировать)"
-        echo "  Завершите ввод строкой:  END"
+        echo "  Затем на ОТДЕЛЬНОЙ строке введите  END  и нажмите Enter."
         AWG_PASTE=""
-        while IFS= read -r line; do
-            [[ "$line" == "END" ]] && break
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%$'\r'}"                          # CR от вставки из Windows
+            [[ "${line//[[:space:]]/}" == "END" ]] && break
             AWG_PASTE+="$line"$'\n'
         done
         [[ -n "$AWG_PASTE" ]] || die "Пустой AmneziaWG-конфиг — повторите запуск и вставьте конфиг клиента."
