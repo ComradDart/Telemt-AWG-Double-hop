@@ -402,6 +402,7 @@ INBOUND_ADDR="${INBOUND_ADDR:-}"
 TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-www.microsoft.com}"
 TELEMT_PORT="${TELEMT_PORT:-8443}"
 OUTBOUND_WG_IP="${OUTBOUND_WG_IP:-}"
+SYN_RATELIMIT="${SYN_RATELIMIT:-no}"
 AWG_PASTE=""
 
 if [[ "$ROLE" == "outbound" ]]; then
@@ -446,6 +447,12 @@ else
     read -rp "Порт telemt внутри туннеля [${TELEMT_PORT}]: " v
     TELEMT_PORT="${v:-$TELEMT_PORT}"
 
+    # SYN rate-limit: полезен для ПУБЛИЧНЫХ прокси под зондированием, но режет
+    # параллельную загрузку медиа у обычных клиентов. Для личной связки — выкл.
+    [[ "$SYN_RATELIMIT" == "yes" ]] && DEF_SRL="y" || DEF_SRL="N"
+    read -rp "Включить анти-DPI SYN rate-limit на :443 (может тормозить медиа Telegram)? [y/N] [${DEF_SRL}]: " v
+    case "$v" in y|Y|yes|YES|да|on|1|true) SYN_RATELIMIT=yes ;; *) SYN_RATELIMIT=no ;; esac
+
     if [[ -s "$AWG_CONF_DIR/$AWG_IFACE.conf" ]]; then
         skip "AmneziaWG-конфиг клиента уже есть ($AWG_CONF_DIR/$AWG_IFACE.conf) — переиспользую"
     else
@@ -475,6 +482,7 @@ INBOUND_ADDR="$INBOUND_ADDR"
 TELEMT_TLS_DOMAIN="$TELEMT_TLS_DOMAIN"
 TELEMT_PORT="$TELEMT_PORT"
 OUTBOUND_WG_IP="$OUTBOUND_WG_IP"
+SYN_RATELIMIT="$SYN_RATELIMIT"
 EOF
 
 log "Параметры: роль=$ROLE, пользователь=$NEW_USER, адрес=$SERVER_HOST, сертификат=режим$CERT_MODE"
@@ -1512,26 +1520,26 @@ fi
 # ==============================================================================
 # ШАГ 11и. Анти-DPI: per-IP SYN rate-limit на :443 (по мотивам MTproxy-reanimation)
 # ==============================================================================
-# Ограничивает темп НОВЫХ соединений с одного IP (1 SYN/с) — снижает «handshake
-# timeout» и сбивает активное зондирование DPI. Висит отдельной nftables-таблицей,
-# не конфликтует с ufw. Отключить: systemctl disable --now telemt-ratelimit.
-log "--- Шаг 11и: nftables SYN rate-limit на :443 ---"
-apt_install nftables
-systemctl enable --now nftables >/dev/null 2>&1 || true
+# ВЫКЛЮЧЕН по умолчанию: `1/с burst 1` режет параллельную загрузку медиа Telegram
+# (клиент открывает пачку соединений). Полезен для ПУБЛИЧНЫХ прокси под зондированием.
+if [[ "$SYN_RATELIMIT" == "yes" ]]; then
+    log "--- Шаг 11и: nftables SYN rate-limit на :443 ---"
+    apt_install nftables
+    systemctl enable --now nftables >/dev/null 2>&1 || true
 
-deploy_file /etc/nftables-telemt.nft 644 <<'EOF' >/dev/null || true
+    deploy_file /etc/nftables-telemt.nft 644 <<'EOF' >/dev/null || true
 #!/usr/sbin/nft -f
 add table inet telemt_limit
 delete table inet telemt_limit
 table inet telemt_limit {
     chain input {
         type filter hook input priority -150; policy accept;
-        tcp dport 443 tcp flags & (syn | ack) == syn meter mtpr_syn { ip saddr timeout 60s limit rate over 1/second burst 1 packets } counter drop comment "mtpr_syn_ratelimit"
+        tcp dport 443 tcp flags & (syn | ack) == syn meter mtpr_syn { ip saddr timeout 60s limit rate over 4/second burst 20 packets } counter drop comment "mtpr_syn_ratelimit"
     }
 }
 EOF
 
-deploy_file /etc/systemd/system/telemt-ratelimit.service 644 <<'EOF' >/dev/null || true
+    deploy_file /etc/systemd/system/telemt-ratelimit.service 644 <<'EOF' >/dev/null || true
 [Unit]
 Description=telemt per-IP SYN rate-limit (nftables)
 After=nftables.service network-pre.target
@@ -1547,12 +1555,20 @@ ExecStop=/usr/sbin/nft delete table inet telemt_limit
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-if systemctl enable --now telemt-ratelimit.service >/dev/null 2>&1; then
-    systemctl restart telemt-ratelimit.service 2>/dev/null || true
-    log "SYN rate-limit активен (1/с на IP, порт 443)"
+    systemctl daemon-reload
+    if systemctl enable --now telemt-ratelimit.service >/dev/null 2>&1; then
+        systemctl restart telemt-ratelimit.service 2>/dev/null || true
+        log "SYN rate-limit активен (4/с burst 20 на IP, порт 443)"
+    else
+        warn "Не удалось включить telemt-ratelimit.service — проверьте: nft -f /etc/nftables-telemt.nft"
+    fi
 else
-    warn "Не удалось включить telemt-ratelimit.service — проверьте: nft -f /etc/nftables-telemt.nft"
+    # Выключено: снимаем сервис/таблицу, если остались от прошлого прогона
+    if systemctl list-unit-files 2>/dev/null | grep -q '^telemt-ratelimit\.service'; then
+        systemctl disable --now telemt-ratelimit.service >/dev/null 2>&1 || true
+    fi
+    nft delete table inet telemt_limit 2>/dev/null || true
+    skip "SYN rate-limit выключен (рекомендуется для личной прокси)"
 fi
 
 CERT_DESC="$INB_CERT_DESC"
