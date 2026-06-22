@@ -1,4 +1,4 @@
-# amnezia-install
+# Telemt-AWG-Double-hop
 
 Интерактивный скрипт первичной настройки VPS под **AmneziaWG** с веб-панелью
 [wg-easy](https://github.com/wg-easy/wg-easy), спрятанной за Nginx по секретному пути.
@@ -70,13 +70,13 @@ Telegram ──443──> INBOUND (РФ)                         OUTBOUND (за 
 
 ```bash
 # через curl
-curl -fsSLO https://raw.githubusercontent.com/ComradDart/amnezia-install/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ComradDart/Telemt-AWG-Double-hop/main/install.sh
 bash install.sh
 ```
 
 ```bash
 # либо через wget
-wget https://raw.githubusercontent.com/ComradDart/amnezia-install/main/install.sh
+wget https://raw.githubusercontent.com/ComradDart/Telemt-AWG-Double-hop/main/install.sh
 bash install.sh
 ```
 
