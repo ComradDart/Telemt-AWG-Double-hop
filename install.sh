@@ -396,6 +396,19 @@ if [[ "$CERT_MODE" == "3" ]]; then
     fi
 fi
 
+# --- fail2ban whitelist (защита от самобана; важно при динамическом IP) ---
+F2B_DETECTED=""
+[[ -n "${SSH_CONNECTION:-}" ]] && F2B_DETECTED=$(awk '{print $1}' <<<"$SSH_CONNECTION")
+echo ""
+echo "fail2ban — какие IP/подсети НЕ банить (чтобы не залочить себя)?"
+[[ -n "$F2B_DETECTED" ]] && echo "  Ваш текущий IP: $F2B_DETECTED  (Enter — внести его)"
+echo "  Можно несколько через пробел. При ДИНАМИЧЕСКОМ IP укажите подсеть"
+echo "  провайдера (напр. 203.0.113.0/24). Введите 'no' — не добавлять никого."
+DEF_WL="${F2B_IGNORE:-$F2B_DETECTED}"
+read -rp "Whitelist [${DEF_WL:-no}]: " v
+v="${v:-${DEF_WL:-no}}"
+case "$v" in no|No|NO|нет|None|none) F2B_IGNORE="" ;; *) F2B_IGNORE="$v" ;; esac
+
 # --- Вопросы под роль (double-hop) ---
 ENABLE_TELEMT="${ENABLE_TELEMT:-no}"
 INBOUND_ADDR="${INBOUND_ADDR:-}"
@@ -483,6 +496,7 @@ TELEMT_TLS_DOMAIN="$TELEMT_TLS_DOMAIN"
 TELEMT_PORT="$TELEMT_PORT"
 OUTBOUND_WG_IP="$OUTBOUND_WG_IP"
 SYN_RATELIMIT="$SYN_RATELIMIT"
+F2B_IGNORE="$F2B_IGNORE"
 EOF
 
 log "Параметры: роль=$ROLE, пользователь=$NEW_USER, адрес=$SERVER_HOST, сертификат=режим$CERT_MODE"
@@ -622,23 +636,23 @@ log "--- Шаг 5: fail2ban ---"
 # backend=systemd работает и на Debian, и на Ubuntu (auth.log может отсутствовать)
 apt_install python3-systemd
 
-# Whitelist: localhost + IP, с которого идёт текущая установка (защита от
-# самобана). $SSH_CONNECTION = "<client_ip> <client_port> <server_ip> <server_port>".
+# Whitelist из ответа пользователя (Шаг 0) + localhost.
 IGNORE_IPS="127.0.0.1/8 ::1"
-if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    ADMIN_IP=$(awk '{print $1}' <<<"$SSH_CONNECTION")
-    [[ -n "$ADMIN_IP" ]] && IGNORE_IPS="$IGNORE_IPS $ADMIN_IP" \
-        && log "fail2ban: ваш IP $ADMIN_IP добавлен в whitelist (бан вам не грозит)"
-fi
+[[ -n "${F2B_IGNORE:-}" ]] && IGNORE_IPS="$IGNORE_IPS $F2B_IGNORE"
+log "fail2ban whitelist: $IGNORE_IPS"
 
 F2B_CHANGED=0
 if deploy_file /etc/fail2ban/jail.local 644 <<EOF
 # Создано vps_setup.sh
-# Чтобы добавить ещё доверенные IP — допишите их в строку ignoreip и
-# выполните: systemctl restart fail2ban
+# Доверенные IP/подсети — в строке ignoreip (через пробел). После правки:
+#   systemctl restart fail2ban
 [DEFAULT]
 backend = systemd
-bantime = 15m
+# базовый бан 1ч; для ПОВТОРНЫХ нарушителей растёт ×2 вплоть до недели
+bantime = 1h
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 1w
 findtime = 10m
 maxretry = 8
 ignoreip = $IGNORE_IPS
