@@ -572,7 +572,7 @@ PermitRootLogin no
 PasswordAuthentication $PASSWORD_AUTH
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
-MaxAuthTries 3
+MaxAuthTries 6
 LoginGraceTime 30
 X11Forwarding no
 ClientAliveInterval 300
@@ -622,14 +622,26 @@ log "--- Шаг 5: fail2ban ---"
 # backend=systemd работает и на Debian, и на Ubuntu (auth.log может отсутствовать)
 apt_install python3-systemd
 
+# Whitelist: localhost + IP, с которого идёт текущая установка (защита от
+# самобана). $SSH_CONNECTION = "<client_ip> <client_port> <server_ip> <server_port>".
+IGNORE_IPS="127.0.0.1/8 ::1"
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    ADMIN_IP=$(awk '{print $1}' <<<"$SSH_CONNECTION")
+    [[ -n "$ADMIN_IP" ]] && IGNORE_IPS="$IGNORE_IPS $ADMIN_IP" \
+        && log "fail2ban: ваш IP $ADMIN_IP добавлен в whitelist (бан вам не грозит)"
+fi
+
 F2B_CHANGED=0
 if deploy_file /etc/fail2ban/jail.local 644 <<EOF
 # Создано vps_setup.sh
+# Чтобы добавить ещё доверенные IP — допишите их в строку ignoreip и
+# выполните: systemctl restart fail2ban
 [DEFAULT]
 backend = systemd
-bantime = 1h
+bantime = 15m
 findtime = 10m
-maxretry = 5
+maxretry = 8
+ignoreip = $IGNORE_IPS
 
 [sshd]
 enabled = true
