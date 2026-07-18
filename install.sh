@@ -1308,7 +1308,7 @@ proxy_protocol = true
 # Значение 1400 подобрано с запасом под накладные расходы туннеля AmneziaWG
 # (MTU ~1420); при желании можно поднять до 1440 или понизить, если будет фрагментация.
 client_mss      = "tspu"
-client_mss_bulk = 1400
+client_mss_bulk = "1400"
 
 [server.api]
 enabled   = true
