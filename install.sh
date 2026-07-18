@@ -117,6 +117,20 @@ deploy_file() {
 # Похоже на домен/IP (только латиница/цифры/.:-_) — отсекает ввод в кириллице.
 is_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]; }
 
+# Подтянуть свежие образы и поднять/обновить стек в каталоге $1.
+# `docker compose pull` обязателен: без него повторный запуск НЕ обновляет образы
+# с плавающими тегами (:latest, :stable, :15) — docker молча берёт старый из кэша.
+# `up -d` пересоздаёт контейнер только если образ/compose реально изменились.
+# Именованные volume'ы (etc_wireguard с ключами AmneziaWG) при этом не трогаются,
+# поэтому обновление сохраняет всех уже созданных клиентов. НИКОГДА не используем
+# здесь `down -v` / `--volumes` — только это удалило бы клиентов.
+compose_up() {
+    local dir="$1"
+    ( cd "$dir"
+      docker compose pull || warn "Не все образы удалось обновить — поднимаю с имеющимися"
+      docker compose up -d )
+}
+
 # Развернуть статическую заглушку (index.html) в каталог $1.
 # Возвращает 0, если файл изменился (как deploy_file).
 deploy_stub() {
@@ -412,7 +426,11 @@ case "$v" in no|No|NO|нет|None|none) F2B_IGNORE="" ;; *) F2B_IGNORE="$v" ;; e
 # --- Вопросы под роль (double-hop) ---
 ENABLE_TELEMT="${ENABLE_TELEMT:-no}"
 INBOUND_ADDR="${INBOUND_ADDR:-}"
-TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-www.microsoft.com}"
+# Маска fake-TLS. Для стабильной работы iOS домен ДОЛЖЕН поддерживать пост-квантовый
+# обмен ключами (X25519MLKEM768) — иначе на iOS бывают обрывы и не грузится медиа.
+# Проверенно подходят Google/Cloudflare/Apple/OpenAI; НЕ годятся VK/Rutube/GitHub.
+# Проверить конкретный домен можно ботом @Sni_checker_bot.
+TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-www.google.com}"
 TELEMT_PORT="${TELEMT_PORT:-8443}"
 OUTBOUND_WG_IP="${OUTBOUND_WG_IP:-}"
 SYN_RATELIMIT="${SYN_RATELIMIT:-no}"
@@ -431,11 +449,15 @@ if [[ "$ROLE" == "outbound" ]]; then
             [[ -n "$INBOUND_ADDR" ]] && is_host "$INBOUND_ADDR" && break
             echo "  Нужен корректный адрес inbound (латиница/цифры/точки) — он идёт в ссылки Telegram."
         done
+        echo ""
+        echo "  Маска fake-TLS — чужой популярный домен (НЕ ваш). Для стабильного iOS"
+        echo "  берите домен с пост-квантовым TLS (X25519MLKEM768): Google/Cloudflare/"
+        echo "  Apple/OpenAI. НЕ подходят VK/Rutube/GitHub. Проверка: @Sni_checker_bot."
         while true; do
-            read -rp "Маска fake-TLS для Telegram (чужой популярный домен, НЕ ваш) [${TELEMT_TLS_DOMAIN}]: " v
+            read -rp "Маска fake-TLS для Telegram [${TELEMT_TLS_DOMAIN}]: " v
             v="${v:-$TELEMT_TLS_DOMAIN}"
             is_host "$v" && { TELEMT_TLS_DOMAIN="$v"; break; }
-            echo "  Похоже на кириллицу/опечатку — домен из латиницы, например www.microsoft.com"
+            echo "  Похоже на кириллицу/опечатку — домен из латиницы, например www.google.com"
         done
         read -rp "Порт telemt внутри туннеля [${TELEMT_PORT}]: " v
         TELEMT_PORT="${v:-$TELEMT_PORT}"
@@ -446,7 +468,7 @@ else
     echo ""
     echo "Параметры для подключения к OUTBOUND (их напечатал outbound-скрипт в конце):"
     while true; do
-        read -rp "Маска fake-TLS Telegram (как на outbound) [${TELEMT_TLS_DOMAIN}]: " v
+        read -rp "Маска fake-TLS Telegram (ТОЧНО как на outbound) [${TELEMT_TLS_DOMAIN}]: " v
         v="${v:-$TELEMT_TLS_DOMAIN}"
         is_host "$v" && { TELEMT_TLS_DOMAIN="$v"; break; }
         echo "  Похоже на кириллицу/опечатку — домен из латиницы."
@@ -1145,14 +1167,10 @@ if dpkg -s nginx >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep
 fi
 
 # --- Запуск/обновление стека ---
-NGINX_RUNNING=$(docker inspect -f '{{.State.Running}}' wg-nginx 2>/dev/null || echo "false")
-WG_RUNNING=$(docker inspect -f '{{.State.Running}}' wg-easy 2>/dev/null || echo "false")
-if (( STACK_CHANGED )) || [[ "$NGINX_RUNNING" != "true" || "$WG_RUNNING" != "true" ]]; then
-    log "Запускаю стек (docker compose up -d)"
-    (cd "$WG_DIR" && docker compose up -d)
-else
-    skip "Стек уже запущен, конфигурация не менялась"
-fi
+# Всегда pull+up: на повторном запуске это подтягивает свежие образы (обновление),
+# на первом — просто поднимает стек. Клиенты AmneziaWG в volume не затрагиваются.
+log "Запускаю/обновляю стек (docker compose pull + up -d)"
+compose_up "$WG_DIR"
 
 # Ждём, пока nginx начнёт отвечать на 443
 log "Жду запуска nginx на https://127.0.0.1 ..."
@@ -1251,7 +1269,8 @@ if [[ "$ENABLE_TELEMT" == "yes" ]]; then
     # Права 644: контейнер telemt работает под non-root и должен прочитать конфиг;
     # каталог /opt/wg-easy остаётся 700, так что обычные юзеры хоста файл не видят.
     mkdir -p "$TELEMT_DIR"
-    deploy_file "$TELEMT_DIR/config.toml" 644 <<EOF >/dev/null || true
+    TELEMT_CFG_CHANGED=0
+    if deploy_file "$TELEMT_DIR/config.toml" 644 <<EOF
 [general]
 fast_mode        = true
 use_middle_proxy = true
@@ -1281,7 +1300,15 @@ client_keepalive = 60
 [server]
 port           = $TELEMT_PORT
 proxy_protocol = true
-client_mss     = "tspu"
+# client_mss = "tspu" фрагментирует пакеты до MSS 92 для обхода DPI, но САМО ПО СЕБЕ
+# резало ВСЮ передачу (в т.ч. медиа) в ~10x пакетов — отсюда тормоза загрузки и
+# «бесконечная загрузка» на iOS. client_mss_bulk (telemt >= 3.4.19) оставляет низкий
+# MSS только на TLS-handshake, а для полезной нагрузки возвращает нормальный MSS —
+# это и есть штатное исправление проблемы с медиа/iOS.
+# Значение 1400 подобрано с запасом под накладные расходы туннеля AmneziaWG
+# (MTU ~1420); при желании можно поднять до 1440 или понизить, если будет фрагментация.
+client_mss      = "tspu"
+client_mss_bulk = 1400
 
 [server.api]
 enabled   = true
@@ -1307,6 +1334,9 @@ ignore_time_skew = false
 [access.users]
 user1 = "$TELEMT_SECRET"
 EOF
+    then
+        TELEMT_CFG_CHANGED=1
+    fi
 
     # 3. telemt_panel — собираем из исходников, рендерим конфиг
     command -v git >/dev/null 2>&1 || apt_install git
@@ -1334,8 +1364,16 @@ EOF
 
     # 4. Перезаписываем compose с telemt + поднимаем (сборка панели — пара минут)
     deploy_file "$WG_DIR/docker-compose.yml" 600 < <(compose_yml 1) >/dev/null || true
-    log "Поднимаю telemt + telemt-panel (docker compose up -d)"
-    (cd "$WG_DIR" && docker compose up -d)
+    log "Поднимаю/обновляю telemt + telemt-panel (docker compose pull + up -d)"
+    compose_up "$WG_DIR"
+
+    # Если обновился только config.toml (без смены образа), up -d НЕ перезапустит
+    # контейнер — bind-mount перечитывается лишь при рестарте. Форсируем.
+    if (( ${TELEMT_CFG_CHANGED:-0} )); then
+        log "config.toml telemt изменился — перезапускаю контейнер telemt"
+        (cd "$WG_DIR" && docker compose restart telemt) \
+            || warn "Не удалось перезапустить telemt (проверьте: docker logs telemt)"
+    fi
 
     sleep 3
     if [[ "$(docker inspect -f '{{.State.Running}}' telemt 2>/dev/null || echo false)" == "true" ]]; then
@@ -1449,7 +1487,8 @@ EOF
 render_inb_nginx >/dev/null || true
 
 # HAProxy: SNI=маска telemt → туннель (send-proxy-v2), иначе → легит-сайт
-deploy_file "$INB_DIR/haproxy.cfg" 644 <<EOF >/dev/null || true
+INB_HAPROXY_CHANGED=0
+if deploy_file "$INB_DIR/haproxy.cfg" 644 <<EOF
 global
     log stdout format raw local0
     maxconn 10000
@@ -1473,6 +1512,9 @@ backend be_tg
 backend be_site
     server site 127.0.0.1:$INB_SITE_TLS_PORT check
 EOF
+then
+    INB_HAPROXY_CHANGED=1
+fi
 
 deploy_file "$INB_DIR/docker-compose.yml" 600 <<'EOF' >/dev/null || true
 services:
@@ -1504,8 +1546,16 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
     systemctl disable --now nginx 2>/dev/null || true
 fi
 
-log "Поднимаю inbound-стек (docker compose up -d)"
-(cd "$INB_DIR" && docker compose up -d)
+log "Поднимаю/обновляю inbound-стек (docker compose pull + up -d)"
+compose_up "$INB_DIR"
+
+# haproxy.cfg смонтирован bind-mount'ом — при изменении up -d контейнер не рестартит.
+# Форсируем перезапуск, чтобы новая маска/бэкенды применились.
+if (( INB_HAPROXY_CHANGED )); then
+    log "haproxy.cfg изменился — перезапускаю inb-haproxy"
+    (cd "$INB_DIR" && docker compose restart haproxy) \
+        || warn "Не удалось перезапустить haproxy (проверьте: docker logs inb-haproxy)"
+fi
 
 inb_nginx_reload() { docker exec inb-nginx nginx -t && docker exec inb-nginx nginx -s reload; }
 
