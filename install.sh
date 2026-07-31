@@ -779,14 +779,47 @@ else
 
     # DKMS собирает amneziawg под ТЕКУЩЕЕ ядро — нужны заголовки именно под него.
     # На свежих VPS запущено старое ядро, для которого заголовков в репозитории уже нет
-    # (есть только под новее). Тогда сборка молча падает, а дальше modprobe даёт FATAL.
-    # Ловим это заранее и даём понятную инструкцию вместо загадочной ошибки.
+    # (есть только под новее). В этом случае АВТОМАТИЧЕСКИ обновляем ядро и перезагружаемся
+    # с автопродолжением установки — пользователю не нужно ничего делать вручную.
     if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
-        die "Нет заголовков под текущее ядро $(uname -r) (в репозитории только под новее).
-   Обновите ядро и перезагрузитесь, затем перезапустите скрипт:
-       sudo apt-get install -y linux-image-generic linux-headers-generic
-       sudo reboot
-   После ребута снова: sudo bash install.sh"
+        if [[ -f "$STATE_DIR/kernel-upgraded" ]]; then
+            die "После обновления ядра и перезагрузки заголовков под $(uname -r) всё ещё нет.
+   Проверьте: uname -r (должно быть НОВОЕ ядро) и наличие linux-headers-\$(uname -r).
+   Вероятно GRUB не переключился на новое ядро — проверьте загрузчик."
+        fi
+        warn "Нет заголовков под текущее ядро $(uname -r). Обновляю ядро и ПЕРЕЗАГРУЖАЮСЬ —"
+        warn "после ребута установка ПРОДОЛЖИТСЯ САМА (отвечать на вопросы заново не нужно)."
+        apt_install linux-image-generic linux-headers-generic
+        touch "$STATE_DIR/kernel-upgraded"
+
+        # Копируем скрипт в стабильное место и ставим одноразовый systemd-юнит: после ребута
+        # он неинтерактивно доигрывает установку. Ответы уже в answers.env; `yes ""` жмёт Enter
+        # на всех промптах -> берутся сохранённые значения. По завершении юнит самоудаляется.
+        cp -f "$(readlink -f "$0" 2>/dev/null || echo "$0")" "$STATE_DIR/install.sh" 2>/dev/null || true
+        chmod +x "$STATE_DIR/install.sh" 2>/dev/null || true
+        cat > /etc/systemd/system/dhop-resume.service <<EOF
+[Unit]
+Description=dhop install auto-resume after kernel upgrade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Доигрываем установку, затем в ЛЮБОМ случае снимаем и удаляем юнит (без циклов).
+ExecStart=/bin/bash -c 'yes "" | bash $STATE_DIR/install.sh >> $LOG_FILE 2>&1; ec=\$?; systemctl disable dhop-resume.service >/dev/null 2>&1; rm -f /etc/systemd/system/dhop-resume.service; exit \$ec'
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable dhop-resume.service >/dev/null 2>&1 || true
+        log "Ядро обновлено. Перезагрузка через 5 секунд — после неё установка продолжится САМА."
+        log "После ребута подключитесь и следите: tail -f $LOG_FILE"
+        sync
+        sleep 5
+        reboot
+        exit 0
     fi
 
     # Подключаем PPA amnezia/ppa
