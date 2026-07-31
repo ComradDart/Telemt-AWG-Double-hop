@@ -565,6 +565,13 @@ log "Параметры: роль=$ROLE, пользователь=$NEW_USER, а�
 # ШАГ 1. Базовые пакеты
 # ==============================================================================
 log "--- Шаг 1: обновление списка пакетов и базовые утилиты ---"
+# На свежих VPS фоновый apt-daily/unattended-upgrades держит dpkg-лок при первом
+# запуске и валит наши apt-get (E: Could not get lock). Просим apt ЖДАТЬ освобождения
+# лока до 300с и ретраить, а не падать сразу. Действует на все последующие apt-get.
+deploy_file /etc/apt/apt.conf.d/99-dhop-lock-timeout 644 <<'EOF' >/dev/null || true
+DPkg::Lock::Timeout "300";
+Acquire::Retries "3";
+EOF
 apt-get update
 apt_install curl ca-certificates gnupg openssl sudo ufw fail2ban
 
