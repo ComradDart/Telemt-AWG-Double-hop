@@ -127,7 +127,11 @@ is_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]; }
 compose_up() {
     local dir="$1"
     ( cd "$dir"
-      docker compose pull || warn "Не все образы удалось обновить — поднимаю с имеющимися"
+      # --ignore-buildable: у telemt-panel только build: (нет image:), обычный pull на
+      # нём ругается. На старом compose флага нет -> откат на обычный pull, затем warn.
+      docker compose pull --ignore-buildable 2>/dev/null \
+          || docker compose pull \
+          || warn "Не все образы удалось обновить — поднимаю с имеющимися"
       docker compose up -d )
 }
 
@@ -671,7 +675,8 @@ if (( SSH_CHANGED )); then
     sshd -t || die "Ошибка в конфигурации SSH — изменения НЕ применены, проверьте $SSHD_DROPIN"
     # reload/restart не разрывает текущие SSH-сессии
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null \
-        || systemctl restart ssh 2>/dev/null || systemctl restart sshd
+        || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null \
+        || warn "Не удалось перезапустить SSH автоматически — примените вручную: systemctl restart ssh"
     log "SSH перенастроен: root-вход запрещён, вход по паролю: $PASSWORD_AUTH"
     warn "НЕ ЗАКРЫВАЙТЕ текущую сессию! Сначала проверьте в новом окне: ssh ${NEW_USER}@${SERVER_HOST}"
 else
@@ -736,7 +741,7 @@ then
     F2B_CHANGED=1
 fi
 
-systemctl enable fail2ban >/dev/null 2>&1
+systemctl enable fail2ban >/dev/null 2>&1 || true
 if (( F2B_CHANGED )) || ! systemctl is-active --quiet fail2ban; then
     log "Перезапускаю fail2ban"
     systemctl restart fail2ban
@@ -844,7 +849,7 @@ else
     apt_install docker-compose-plugin
 fi
 
-systemctl enable --now docker >/dev/null 2>&1
+systemctl enable --now docker >/dev/null 2>&1 || true
 log "Docker готов"
 
 # ==============================================================================
@@ -1241,9 +1246,18 @@ if [[ -f "$WG_BACKUP" ]]; then
     # ниже подставляется дефолтное имя.
     WG_VOL=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '_etc_wireguard$' | head -1 || true)
     WG_VOL="${WG_VOL:-wg-easy_etc_wireguard}"
+    # Заранее тянем alpine, иначе проверки/распаковки ниже могут упасть на свежем боксе.
+    docker pull alpine >/dev/null 2>&1 || true
+    # Проверяем содержимое volume ТОЧНО. "" = подтверждённо пусто -> восстанавливаем.
+    # Если проверить НЕ удалось (нет alpine и т.п.) — ставим маркер и восстановление
+    # ПРОПУСКАЕМ (fail-safe: лучше не восстановить, чем затереть рабочие данные).
     VOL_CONTENT=""
-    docker volume inspect "$WG_VOL" >/dev/null 2>&1 && \
-        VOL_CONTENT=$(docker run --rm -v "$WG_VOL":/d alpine sh -c 'ls -A /d 2>/dev/null' || true)
+    if docker volume inspect "$WG_VOL" >/dev/null 2>&1; then
+        if ! VOL_CONTENT=$(docker run --rm -v "$WG_VOL":/d alpine sh -c 'ls -A /d'); then
+            warn "Не удалось проверить содержимое volume $WG_VOL — восстановление ПРОПУЩЕНО (не рискую затереть данные)"
+            VOL_CONTENT="__unknown__"
+        fi
+    fi
     if [[ -z "$VOL_CONTENT" ]]; then
         log "Найден бэкап $WG_BACKUP — восстанавливаю AWG-клиентов в volume $WG_VOL"
         docker volume create "$WG_VOL" >/dev/null 2>&1 || true
@@ -1255,6 +1269,18 @@ if [[ -f "$WG_BACKUP" ]]; then
             if docker run --rm -v "$WG_VOL":/d -v "$TMP_R/dhop-backup":/b:ro alpine \
                    sh -c 'tar xzf /b/etc_wireguard.tar.gz -C /d'; then
                 log "Клиенты wg-easy восстановлены из бэкапа (INIT не сработает — volume не пуст)"
+                # КРИТИЧНО: обнуляем серверные I1-I5 в restored wg-easy.db. Старая версия/
+                # миграция записывают их непустыми, а модуль amneziawg их отвергает
+                # (awg setconf -> "Invalid argument" -> wg0 не поднимается). I1-I5 разрешено
+                # отличаться у сервера и клиента, поэтому обнуление НЕ ломает существующие
+                # .conf: серверный ключ, S1-S4, H1-H4 и пиры сохраняются (по research
+                # wg-easy 15.3 + amneziawg-linux-kernel-module).
+                if docker run --rm -v "$WG_VOL":/d alpine sh -c \
+                     'apk add --no-cache sqlite >/dev/null 2>&1 && [ -f /d/wg-easy.db ] && sqlite3 /d/wg-easy.db "UPDATE interfaces_table SET i1=NULL,i2=NULL,i3=NULL,i4=NULL,i5=NULL;"'; then
+                    log "Серверные I1-I5 обнулены в wg-easy.db (клиентские .conf не затронуты)"
+                else
+                    warn "Не удалось обнулить I1-I5 в wg-easy.db — если wg0 не поднимется с 'Invalid argument', причина здесь"
+                fi
             else
                 warn "Не удалось распаковать etc_wireguard.tar.gz в volume — проверьте бэкап"
             fi
@@ -1364,7 +1390,7 @@ if [[ "$ENABLE_TELEMT" == "yes" ]]; then
     WG_TUN_IP=""
     for _ in $(seq 1 30); do
         WG_TUN_IP=$(docker exec wg-easy ip -4 -o addr show 2>/dev/null \
-            | awk '$2 ~ /^wg/ {print $4}' | cut -d/ -f1 | head -n1 || true)
+            | awk '$2 ~ /^(a?wg)/ {print $4}' | cut -d/ -f1 | head -n1 || true)
         [[ -n "$WG_TUN_IP" ]] && break
         sleep 2
     done
@@ -1614,9 +1640,11 @@ else
     warn "ufw route allow не сработал — если клиенты не подключаются, проверьте форвардинг ufw"
 fi
 
-# nftables DNAT+masquerade (персистентно через systemd-юнит)
+# nftables DNAT+masquerade (персистентно через systemd-юнит dhop-dnat ниже).
+# ВАЖНО: НЕ включаем сервис nftables.service — его /etc/nftables.conf начинается с
+# `flush ruleset`, что стёрло бы правила ufw (на Ubuntu ufw работает поверх nft).
+# Нам нужен только бинарник nft; персистентность DNAT даёт dhop-dnat.service.
 apt_install nftables
-systemctl enable --now nftables >/dev/null 2>&1 || true
 
 deploy_file /etc/nftables-dhop-dnat.nft 644 <<EOF >/dev/null || true
 #!/usr/sbin/nft -f
@@ -1643,7 +1671,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/nftables-dhop-dnat.nft
-ExecStop=/usr/sbin/nft delete table ip dhop_dnat
+ExecStop=/bin/sh -c '/usr/sbin/nft delete table ip dhop_dnat 2>/dev/null || true'
 [Install]
 WantedBy=multi-user.target
 EOF
