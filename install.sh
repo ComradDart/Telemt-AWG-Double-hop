@@ -327,7 +327,7 @@ echo ""
 echo "Роль этого сервера в схеме двойного прыжка (double-hop):"
 echo "  1) outbound — сервер ЗА РУБЕЖОМ (точка выхода): AmneziaWG (wg-easy) + панель"
 echo "                + опционально telemt (выход к Telegram)"
-echo "  2) inbound  — сервер В РФ (точка входа): HAProxy + nginx + AmneziaWG-клиент к outbound"
+echo "  2) inbound  — сервер В РФ (точка входа): L4 DNAT :443 -> telemt + AmneziaWG-клиент"
 echo "  Для обычного VPN без двойного прыжка выбирайте 1 (outbound)."
 [[ "$DEF_ROLE" == "inbound" ]] && DEF_ROLE_N=2 || DEF_ROLE_N=1
 while true; do
@@ -434,6 +434,12 @@ TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-www.google.com}"
 TELEMT_PORT="${TELEMT_PORT:-8443}"
 OUTBOUND_WG_IP="${OUTBOUND_WG_IP:-}"
 SYN_RATELIMIT="${SYN_RATELIMIT:-no}"
+# Прикрытие :443 для чужого/сканирующего SNI (архитектура R1: telemt сам терминирует
+# клиентский TCP, поэтому его прикрытие и client_mss реально доходят до телефона).
+#   popular   — telemt фронтит мисдирект на сам популярный домен маски (его реальный серт)
+#   self-mask — ваш домен + реальный LE-серт, отдаётся ваш сайт-прикрытие (через wg-nginx)
+COVER_MODE="${COVER_MODE:-popular}"
+COVER_DOMAIN="${COVER_DOMAIN:-}"
 AWG_PASTE=""
 
 if [[ "$ROLE" == "outbound" ]]; then
@@ -461,7 +467,37 @@ if [[ "$ROLE" == "outbound" ]]; then
         done
         read -rp "Порт telemt внутри туннеля [${TELEMT_PORT}]: " v
         TELEMT_PORT="${v:-$TELEMT_PORT}"
-        log "telemt включён: вход=$INBOUND_ADDR, маска=$TELEMT_TLS_DOMAIN, порт=$TELEMT_PORT (панель ставится)"
+
+        echo ""
+        echo "  Прикрытие :443 для чужого/сканирующего SNI (что видит DPI):"
+        echo "   1) popular  — фронт на сам популярный домен маски (его реальный серт)"
+        echo "   2) self-mask — ВАШ домен + реальный серт Let's Encrypt, отдаётся ваш сайт"
+        [[ "$COVER_MODE" == "self-mask" ]] && DEF_CM=2 || DEF_CM=1
+        while true; do
+            read -rp "Вариант [1/2] [${DEF_CM}]: " cm
+            cm="${cm:-$DEF_CM}"
+            case "$cm" in
+                1) COVER_MODE=popular;   break ;;
+                2) COVER_MODE=self-mask; break ;;
+                *) echo "  Введите 1 или 2." ;;
+            esac
+        done
+        if [[ "$COVER_MODE" == "self-mask" ]]; then
+            echo "  self-mask отдаёт сайт-заглушку по вашему домену с РЕАЛЬНЫМ сертификатом"
+            echo "  (через wg-nginx). Нужен режим TLS 2/3 (Let's Encrypt): самоподписанный"
+            echo "  серт выдаст прокси. По умолчанию домен-прикрытие = домен этого сервера"
+            echo "  ($SERVER_HOST) — тогда используется уже выпущенный для него сертификат."
+            echo "  Если укажете ДРУГОЙ домен, убедитесь, что сертификат покрывает и его."
+            DEF_COVER="${COVER_DOMAIN:-$SERVER_HOST}"
+            while true; do
+                read -rp "Домен-прикрытие (латиница, НЕ IP) [${DEF_COVER}]: " v
+                COVER_DOMAIN="${v:-$DEF_COVER}"
+                [[ -n "$COVER_DOMAIN" ]] && is_host "$COVER_DOMAIN" && ! [[ "$COVER_DOMAIN" =~ ^[0-9.]+$ ]] && break
+                echo "  Нужен домен (не IP) — на него нужен реальный сертификат."
+            done
+            [[ "$CERT_MODE" == "1" ]] && warn "Выбран самоподписанный серт (режим 1) — для self-mask лучше перезапустить с TLS 2/3."
+        fi
+        log "telemt включён: вход=$INBOUND_ADDR, маска=$TELEMT_TLS_DOMAIN, порт=$TELEMT_PORT, прикрытие=$COVER_MODE (панель ставится)"
     fi
 else
     # inbound: параметры берутся из печати outbound-скрипта
@@ -518,6 +554,8 @@ TELEMT_TLS_DOMAIN="$TELEMT_TLS_DOMAIN"
 TELEMT_PORT="$TELEMT_PORT"
 OUTBOUND_WG_IP="$OUTBOUND_WG_IP"
 SYN_RATELIMIT="$SYN_RATELIMIT"
+COVER_MODE="$COVER_MODE"
+COVER_DOMAIN="$COVER_DOMAIN"
 F2B_IGNORE="$F2B_IGNORE"
 EOF
 
@@ -916,7 +954,9 @@ services:
     depends_on:
       - wg-easy
     networks:
-      - wg
+      wg:
+        # статический IP: telemt (self-mask cover) фронтит сюда через exclusive_mask
+        ipv4_address: 10.42.42.43
     ports:
       - "80:80"
       - "443:443"
@@ -1166,6 +1206,41 @@ if dpkg -s nginx >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep
     fi
 fi
 
+# --- Восстановление AWG-клиентов из бэкапа (свежая установка outbound) ---
+# Перед первым стартом wg-easy: если рядом лежит /root/dhop-backup.tar.gz (снятый со
+# старого сервера), распаковываем ключи/базу wg-easy в volume ДО запуска — тогда все
+# ранее созданные клиенты сохраняются и переподключаются со своими .conf.
+# Восстанавливаем ТОЛЬКО в пустой volume, чтобы никогда не затереть рабочие данные.
+WG_BACKUP="/root/dhop-backup.tar.gz"
+if [[ -f "$WG_BACKUP" ]]; then
+    WG_VOL=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '_etc_wireguard$' | head -1)
+    WG_VOL="${WG_VOL:-wg-easy_etc_wireguard}"
+    VOL_CONTENT=""
+    docker volume inspect "$WG_VOL" >/dev/null 2>&1 && \
+        VOL_CONTENT=$(docker run --rm -v "$WG_VOL":/d alpine sh -c 'ls -A /d 2>/dev/null' || true)
+    if [[ -z "$VOL_CONTENT" ]]; then
+        log "Найден бэкап $WG_BACKUP — восстанавливаю AWG-клиентов в volume $WG_VOL"
+        docker volume create "$WG_VOL" >/dev/null 2>&1 || true
+        TMP_R=$(mktemp -d)
+        tar xzf "$WG_BACKUP" -C "$TMP_R"
+        if [[ -f "$TMP_R/dhop-backup/etc_wireguard.tar.gz" ]]; then
+            docker run --rm -v "$WG_VOL":/d -v "$TMP_R/dhop-backup":/b:ro alpine \
+                sh -c 'tar xzf /b/etc_wireguard.tar.gz -C /d' \
+                && log "Клиенты wg-easy восстановлены из бэкапа (INIT wg-easy не сработает — volume не пуст)"
+        else
+            warn "В бэкапе нет dhop-backup/etc_wireguard.tar.gz — восстановление пропущено"
+        fi
+        # Секреты прошлого сервера — если своих ещё нет (сохранит пути панели/секрет telemt)
+        if [[ -f "$TMP_R/dhop-backup/secrets.env" && ! -s "$SECRETS_FILE" ]]; then
+            cp "$TMP_R/dhop-backup/secrets.env" "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"
+            log "Секреты восстановлены из бэкапа ($SECRETS_FILE)"
+        fi
+        rm -rf "$TMP_R"
+    else
+        skip "Volume $WG_VOL уже с данными — восстановление из бэкапа пропущено (не затираю)"
+    fi
+fi
+
 # --- Запуск/обновление стека ---
 # Всегда pull+up: на повторном запуске это подтягивает свежие образы (обновление),
 # на первом — просто поднимает стек. Клиенты AmneziaWG в volume не затрагиваются.
@@ -1269,6 +1344,42 @@ if [[ "$ENABLE_TELEMT" == "yes" ]]; then
     # Права 644: контейнер telemt работает под non-root и должен прочитать конфиг;
     # каталог /opt/wg-easy остаётся 700, так что обычные юзеры хоста файл не видят.
     mkdir -p "$TELEMT_DIR"
+
+    # Прикрытие :443 (секция [censorship]). В R1 telemt сам терминирует клиентский
+    # TCP (inbound делает L4 DNAT), поэтому фронтинг/reject реально доходят до DPI.
+    #   popular   — unknown_sni_action="mask": мисдирект прозрачно проксируется на сам
+    #               домен маски (mask_host=tls_domain) -> клиент видит его РЕАЛЬНЫЙ серт.
+    #   self-mask — reject_handshake (как nginx ssl_reject_handshake) + exclusive_mask:
+    #               ваш домен-прикрытие отдаётся реальным сайтом с реальным LE-сертом
+    #               (wg-nginx на статике 10.42.42.43).
+    if [[ "$COVER_MODE" == "self-mask" ]]; then
+        TELEMT_CENSORSHIP=$(cat <<EOF2
+tls_domain         = "$TELEMT_TLS_DOMAIN"
+mask               = true
+mask_port          = 443
+tls_emulation      = true
+tls_front_dir      = "tlsfront"
+unknown_sni_action = "reject_handshake"
+fake_cert_len      = 2048
+
+[censorship.exclusive_mask]
+"$COVER_DOMAIN" = "10.42.42.43:443"
+EOF2
+)
+    else
+        TELEMT_CENSORSHIP=$(cat <<EOF2
+tls_domain         = "$TELEMT_TLS_DOMAIN"
+mask               = true
+mask_host          = "$TELEMT_TLS_DOMAIN"
+mask_port          = 443
+tls_emulation      = true
+tls_front_dir      = "tlsfront"
+unknown_sni_action = "mask"
+fake_cert_len      = 2048
+EOF2
+)
+    fi
+
     TELEMT_CFG_CHANGED=0
     if deploy_file "$TELEMT_DIR/config.toml" 644 <<EOF
 [general]
@@ -1299,14 +1410,13 @@ client_keepalive = 60
 
 [server]
 port           = $TELEMT_PORT
-proxy_protocol = true
-# client_mss = "tspu" фрагментирует пакеты до MSS 92 для обхода DPI, но САМО ПО СЕБЕ
-# резало ВСЮ передачу (в т.ч. медиа) в ~10x пакетов — отсюда тормоза загрузки и
-# «бесконечная загрузка» на iOS. client_mss_bulk (telemt >= 3.4.19) оставляет низкий
-# MSS только на TLS-handshake, а для полезной нагрузки возвращает нормальный MSS —
-# это и есть штатное исправление проблемы с медиа/iOS.
-# Значение 1400 подобрано с запасом под накладные расходы туннеля AmneziaWG
-# (MTU ~1420); при желании можно поднять до 1440 или понизить, если будет фрагментация.
+# R1: inbound делает L4 DNAT (без send-proxy-v2), поэтому proxy_protocol ВЫКЛючен.
+# Теперь telemt сам терминирует клиентский TCP -> его client_mss РЕАЛЬНО доходит до
+# телефона (при HAProxy-фронте он резался и был бесполезен). client_mss="tspu" (MSS 92)
+# фрагментирует большой PQ-ServerHello iOS -> TSPU не дропает его по размеру; а
+# client_mss_bulk (>=3.4.19) возвращает нормальный MSS для payload -> быстрые медиа.
+# 1400 — с запасом под MTU туннеля AWG (~1420).
+proxy_protocol = false
 client_mss      = "tspu"
 client_mss_bulk = "1400"
 
@@ -1319,13 +1429,7 @@ whitelist = ["127.0.0.1/32", "::1/128"]
 ip = "$WG_TUN_IP"
 
 [censorship]
-tls_domain         = "$TELEMT_TLS_DOMAIN"
-mask               = true
-mask_port          = 443
-tls_emulation      = true
-tls_front_dir      = "tlsfront"
-unknown_sni_action = "reject_handshake"
-fake_cert_len      = 2048
+$TELEMT_CENSORSHIP
 
 [access]
 replay_check_len = 65536
@@ -1396,6 +1500,8 @@ INBOUND_ADDR="$INBOUND_ADDR"
 TELEMT_TLS_DOMAIN="$TELEMT_TLS_DOMAIN"
 TELEMT_PORT="$TELEMT_PORT"
 OUTBOUND_WG_IP="${WG_TUN_IP:-$OUTBOUND_WG_IP}"
+COVER_MODE="$COVER_MODE"
+COVER_DOMAIN="$COVER_DOMAIN"
 EOF
 
 else
@@ -1439,217 +1545,111 @@ else
 fi
 
 # ==============================================================================
-# ШАГ 10и. Легит-сайт (nginx) + HAProxy (SNI-роутер) + TLS
+# ШАГ 10и. L4-форвардер :443 -> telemt через туннель (R1, вместо HAProxy)
 # ==============================================================================
-log "--- Шаг 10и: nginx (легит-сайт) + HAProxy ---"
+# В R1 inbound НЕ терминирует TLS: он делает L3/L4 DNAT входящих :443 в туннель на
+# telemt (outbound). Так telemt сам становится TCP-эндпоинтом клиента, и его анти-DPI
+# (client_mss/client_mss_bulk + fake-TLS-прикрытие) РЕАЛЬНО доходит до телефона —
+# HAProxy раньше пере-сегментировал ответ и всё это обнулял. Легит-сайт/прикрытие
+# теперь отдаёт сам telemt (unknown_sni_action). masquerade нужен, чтобы ответы telemt
+# возвращались через inbound (ценой того, что telemt видит IP inbound, а не клиента —
+# для личной прокси это не важно, synlimit по клиентам нам не нужен).
+log "--- Шаг 10и: L4 DNAT :443 -> telemt ($OUTBOUND_WG_IP:$TELEMT_PORT) через $AWG_IFACE ---"
 
-mkdir -p "$INB_DIR" "$INB_SSL_DIR"
-deploy_stub "$INB_STUB_DIR" >/dev/null || true
-
-# bootstrap самоподписанный
-if [[ ! -s "$INB_SSL_DIR/selfsigned.crt" ]]; then
-    log "Генерирую самоподписанный сертификат для $SERVER_HOST"
-    if [[ "$SERVER_HOST" =~ ^[0-9.]+$ ]]; then SAN="IP:$SERVER_HOST"; else SAN="DNS:$SERVER_HOST"; fi
-    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-        -keyout "$INB_SSL_DIR/selfsigned.key" -out "$INB_SSL_DIR/selfsigned.crt" \
-        -subj "/CN=$SERVER_HOST" -addext "subjectAltName=$SAN"
-    chmod 600 "$INB_SSL_DIR/selfsigned.key"
+# Сносим старый inbound-стек HAProxy+nginx, если остался от прежней версии (in-place).
+if [[ -f "$INB_DIR/docker-compose.yml" ]]; then
+    warn "Обнаружен старый inbound-стек (HAProxy/nginx) — останавливаю (томов у него нет)"
+    (cd "$INB_DIR" && docker compose down 2>/dev/null) || true
 fi
-
-INB_LE_LIVE="/etc/letsencrypt/live/$SERVER_HOST"
-INB_CRT="/etc/nginx/ssl/selfsigned.crt"; INB_KEY="/etc/nginx/ssl/selfsigned.key"
-INB_CERT_DESC="самоподписанный (браузер покажет предупреждение)"
-if [[ "$CERT_MODE" != "1" && -s "$INB_LE_LIVE/fullchain.pem" ]]; then
-    INB_CRT="$INB_LE_LIVE/fullchain.pem"; INB_KEY="$INB_LE_LIVE/privkey.pem"; INB_CERT_DESC="Let's Encrypt"
+# Старый SYN-ratelimit из прежних версий — снять, чтобы не мешал.
+if systemctl list-unit-files 2>/dev/null | grep -q '^telemt-ratelimit\.service'; then
+    systemctl disable --now telemt-ratelimit.service >/dev/null 2>&1 || true
 fi
+nft delete table inet telemt_limit 2>/dev/null || true
 
-# nginx легит-сайта: :80 (ACME) + 127.0.0.1:8443 (TLS, за HAProxy)
-render_inb_nginx() {
-    deploy_file "$INB_DIR/nginx.conf" 644 <<EOF
-server {
-    listen 80 default_server;
-    server_name _;
-    server_tokens off;
-    location ^~ /.well-known/acme-challenge/ { root /var/www/site; default_type "text/plain"; try_files \$uri =404; }
-    location / { root /var/www/site; index index.html; try_files \$uri \$uri/ =404; }
-}
-server {
-    listen 127.0.0.1:$INB_SITE_TLS_PORT ssl default_server;
-    server_name _;
-    server_tokens off;
-    ssl_certificate     $INB_CRT;
-    ssl_certificate_key $INB_KEY;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    location / { root /var/www/site; index index.html; try_files \$uri \$uri/ =404; }
-}
+# IP-форвардинг (иначе DNAT в туннель не поедет)
+deploy_file /etc/sysctl.d/99-dhop-forward.conf 644 <<'EOF' >/dev/null || true
+net.ipv4.ip_forward=1
 EOF
-}
-render_inb_nginx >/dev/null || true
+sysctl -p /etc/sysctl.d/99-dhop-forward.conf >/dev/null 2>&1 || true
 
-# HAProxy: SNI=маска telemt → туннель (send-proxy-v2), иначе → легит-сайт
-INB_HAPROXY_CHANGED=0
-if deploy_file "$INB_DIR/haproxy.cfg" 644 <<EOF
-global
-    log stdout format raw local0
-    maxconn 10000
-defaults
-    log     global
-    mode    tcp
-    option  tcplog
-    timeout connect 5s
-    timeout client  1h
-    timeout server  1h
-    timeout check   5s
-frontend fe_443
-    bind 0.0.0.0:443
-    tcp-request inspect-delay 5s
-    tcp-request content accept if { req_ssl_hello_type 1 }
-    acl sni_tg req.ssl_sni -i $TELEMT_TLS_DOMAIN
-    use_backend be_tg if sni_tg
-    default_backend be_site
-backend be_tg
-    server tg $OUTBOUND_WG_IP:$TELEMT_PORT send-proxy-v2 check
-backend be_site
-    server site 127.0.0.1:$INB_SITE_TLS_PORT check
-EOF
-then
-    INB_HAPROXY_CHANGED=1
+# ufw по умолчанию DROP'ает форвардинг — разрешаем (бокс работает шлюзом к telemt).
+if [[ -f /etc/default/ufw ]] && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw; then
+    sed -i 's/^DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    ufw reload >/dev/null 2>&1 || true
+    log "ufw: форвардинг разрешён (DEFAULT_FORWARD_POLICY=ACCEPT)"
 fi
 
-deploy_file "$INB_DIR/docker-compose.yml" 600 <<'EOF' >/dev/null || true
-services:
-  nginx:
-    image: nginx:stable
-    container_name: inb-nginx
-    network_mode: host
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./site:/var/www/site:ro
-      - ./ssl:/etc/nginx/ssl:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-    restart: unless-stopped
-  haproxy:
-    image: haproxy:lts-alpine
-    container_name: inb-haproxy
-    user: "root"
-    network_mode: host
-    depends_on:
-      - nginx
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    restart: unless-stopped
-EOF
+# nftables DNAT+masquerade (персистентно через systemd-юнит)
+apt_install nftables
+systemctl enable --now nftables >/dev/null 2>&1 || true
 
-# освобождаем 80/443 от системного nginx, если он остался
-if systemctl is-active --quiet nginx 2>/dev/null; then
-    warn "Останавливаю системный nginx (порты 80/443 займут контейнеры)"
-    systemctl disable --now nginx 2>/dev/null || true
-fi
-
-log "Поднимаю/обновляю inbound-стек (docker compose pull + up -d)"
-compose_up "$INB_DIR"
-
-# haproxy.cfg смонтирован bind-mount'ом — при изменении up -d контейнер не рестартит.
-# Форсируем перезапуск, чтобы новая маска/бэкенды применились.
-if (( INB_HAPROXY_CHANGED )); then
-    log "haproxy.cfg изменился — перезапускаю inb-haproxy"
-    (cd "$INB_DIR" && docker compose restart haproxy) \
-        || warn "Не удалось перезапустить haproxy (проверьте: docker logs inb-haproxy)"
-fi
-
-inb_nginx_reload() { docker exec inb-nginx nginx -t && docker exec inb-nginx nginx -s reload; }
-
-# certbot для домена inbound (если выбран LE)
-if [[ "$CERT_MODE" != "1" && ! -s "$INB_LE_LIVE/fullchain.pem" ]]; then
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    deploy_file /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh 755 <<'EOF' >/dev/null || true
-#!/bin/sh
-docker exec inb-nginx nginx -s reload
-EOF
-    if [[ "$CERT_MODE" == "2" ]]; then
-        log "Выпускаю сертификат Let's Encrypt (HTTP-01) для $SERVER_HOST"
-        apt_install certbot
-        certbot certonly --webroot -w "$INB_STUB_DIR" -d "$SERVER_HOST" \
-            --non-interactive --agree-tos -m "$LE_EMAIL" \
-            || warn "Не удалось получить сертификат (HTTP-01). Остаюсь на самоподписанном."
-    elif [[ "$CERT_MODE" == "3" ]]; then
-        log "Выпускаю сертификат Let's Encrypt (Cloudflare DNS-01) для $SERVER_HOST"
-        apt_install certbot python3-certbot-dns-cloudflare
-        mkdir -p "$(dirname "$CF_CREDS_FILE")"; chmod 700 "$(dirname "$CF_CREDS_FILE")"
-        if [[ -n "$CF_TOKEN" ]]; then
-            printf 'dns_cloudflare_api_token = %s\n' "$CF_TOKEN" > "$CF_CREDS_FILE"
-            chmod 600 "$CF_CREDS_FILE"
-        fi
-        certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDS_FILE" \
-            --dns-cloudflare-propagation-seconds 30 -d "$SERVER_HOST" \
-            --non-interactive --agree-tos -m "$LE_EMAIL" \
-            || warn "Не удалось получить сертификат (DNS-01). Остаюсь на самоподписанном."
-    fi
-    if [[ -s "$INB_LE_LIVE/fullchain.pem" ]]; then
-        INB_CRT="$INB_LE_LIVE/fullchain.pem"; INB_KEY="$INB_LE_LIVE/privkey.pem"; INB_CERT_DESC="Let's Encrypt"
-        render_inb_nginx >/dev/null || true
-        inb_nginx_reload || true
-        log "Inbound nginx переключён на сертификат Let's Encrypt"
-    fi
-fi
-
-# ==============================================================================
-# ШАГ 11и. Анти-DPI: per-IP SYN rate-limit на :443 (по мотивам MTproxy-reanimation)
-# ==============================================================================
-# ВЫКЛЮЧЕН по умолчанию: `1/с burst 1` режет параллельную загрузку медиа Telegram
-# (клиент открывает пачку соединений). Полезен для ПУБЛИЧНЫХ прокси под зондированием.
-if [[ "$SYN_RATELIMIT" == "yes" ]]; then
-    log "--- Шаг 11и: nftables SYN rate-limit на :443 ---"
-    apt_install nftables
-    systemctl enable --now nftables >/dev/null 2>&1 || true
-
-    deploy_file /etc/nftables-telemt.nft 644 <<'EOF' >/dev/null || true
+deploy_file /etc/nftables-dhop-dnat.nft 644 <<EOF >/dev/null || true
 #!/usr/sbin/nft -f
-add table inet telemt_limit
-delete table inet telemt_limit
-table inet telemt_limit {
-    chain input {
-        type filter hook input priority -150; policy accept;
-        tcp dport 443 tcp flags & (syn | ack) == syn meter mtpr_syn { ip saddr timeout 60s limit rate over 4/second burst 20 packets } counter drop comment "mtpr_syn_ratelimit"
+add table ip dhop_dnat
+delete table ip dhop_dnat
+table ip dhop_dnat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        tcp dport 443 dnat to $OUTBOUND_WG_IP:$TELEMT_PORT
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip daddr $OUTBOUND_WG_IP tcp dport $TELEMT_PORT masquerade
     }
 }
 EOF
 
-    deploy_file /etc/systemd/system/telemt-ratelimit.service 644 <<'EOF' >/dev/null || true
+deploy_file /etc/systemd/system/dhop-dnat.service 644 <<'EOF' >/dev/null || true
 [Unit]
-Description=telemt per-IP SYN rate-limit (nftables)
-After=nftables.service network-pre.target
-Wants=network-pre.target
-
+Description=double-hop inbound L4 DNAT :443 -> telemt over tunnel
+After=nftables.service network-online.target awg-quick@awg0.service
+Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f /etc/nftables-telemt.nft
-ExecStop=/usr/sbin/nft delete table inet telemt_limit
-
+ExecStart=/usr/sbin/nft -f /etc/nftables-dhop-dnat.nft
+ExecStop=/usr/sbin/nft delete table ip dhop_dnat
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    if systemctl enable --now telemt-ratelimit.service >/dev/null 2>&1; then
-        systemctl restart telemt-ratelimit.service 2>/dev/null || true
-        log "SYN rate-limit активен (4/с burst 20 на IP, порт 443)"
-    else
-        warn "Не удалось включить telemt-ratelimit.service — проверьте: nft -f /etc/nftables-telemt.nft"
-    fi
+systemctl daemon-reload
+if systemctl enable --now dhop-dnat.service >/dev/null 2>&1; then
+    systemctl restart dhop-dnat.service 2>/dev/null || true
+    log "DNAT активен: :443 -> $OUTBOUND_WG_IP:$TELEMT_PORT (через $AWG_IFACE)"
 else
-    # Выключено: снимаем сервис/таблицу, если остались от прошлого прогона
-    if systemctl list-unit-files 2>/dev/null | grep -q '^telemt-ratelimit\.service'; then
-        systemctl disable --now telemt-ratelimit.service >/dev/null 2>&1 || true
-    fi
-    nft delete table inet telemt_limit 2>/dev/null || true
-    skip "SYN rate-limit выключен (рекомендуется для личной прокси)"
+    warn "Не удалось применить DNAT — проверьте: nft -f /etc/nftables-dhop-dnat.nft"
 fi
 
-CERT_DESC="$INB_CERT_DESC"
+# Сквозная проверка: telemt виден по туннелю (значит DNAT доедет)
+if timeout 5 bash -c "exec 3<>/dev/tcp/$OUTBOUND_WG_IP/$TELEMT_PORT" 2>/dev/null; then
+    log "telemt доступен по туннелю ($OUTBOUND_WG_IP:$TELEMT_PORT)"
+else
+    warn "telemt пока недоступен по туннелю — проверьте awg show $AWG_IFACE и telemt на outbound"
+fi
+
+CERT_DESC="inbound: L4 DNAT :443 -> telemt (TLS терминирует telemt на outbound)"
 
 fi  # конец ветки по роли (outbound/inbound)
+
+# ==============================================================================
+# ШАГ 10.5. Автообновления безопасности ОС (unattended-upgrades)
+# ==============================================================================
+# Только security-обновления, БЕЗ автоперезагрузок (сервисы поднимаются сами:
+# restart=unless-stopped у контейнеров, awg-quick@ и dhop-dnat в автозапуске).
+log "--- Автообновления безопасности ОС ---"
+apt_install unattended-upgrades
+deploy_file /etc/apt/apt.conf.d/20auto-upgrades 644 <<'EOF' >/dev/null || true
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+# Явно НЕ включаем автоперезагрузку (по запросу: только патчи, без ребутов).
+deploy_file /etc/apt/apt.conf.d/51dhop-no-reboot 644 <<'EOF' >/dev/null || true
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+log "unattended-upgrades: security-патчи включены, автоперезагрузка выключена"
 
 # ==============================================================================
 # ШАГ 11. Памятка и итоговый вывод
@@ -1721,18 +1721,18 @@ EOF
 else
     deploy_file "$PANEL_INFO_FILE" 600 <<EOF >/dev/null || true
 ============================================================
- INBOUND (в РФ) — HAProxy + nginx + AmneziaWG-клиент
+ INBOUND (в РФ) — L4 DNAT :443 -> telemt + AmneziaWG-клиент
 ============================================================
- Точка входа:       $SERVER_HOST:443
- Легит-сайт:        https://$SERVER_HOST/   (TLS: $CERT_DESC)
+ Точка входа:       $SERVER_HOST:443  (весь :443 идёт DNAT'ом в туннель на telemt)
+ TLS/прикрытие:     терминирует telemt на outbound ($CERT_DESC)
  SSH-пользователь:  $NEW_USER (root по SSH отключён, порт $SSH_PORT/tcp)
 
  Туннель к outbound: AmneziaWG ($AWG_IFACE) -> telemt $OUTBOUND_WG_IP:$TELEMT_PORT
- Маршрут Telegram:  HAProxy :443, SNI=$TELEMT_TLS_DOMAIN -> туннель -> telemt
-                    остальной SNI -> легит-сайт (nginx 127.0.0.1:$INB_SITE_TLS_PORT)
+ Маршрут:           :443 --DNAT--> $OUTBOUND_WG_IP:$TELEMT_PORT (masquerade)
+                    telemt сам решает: маска -> Telegram; прочий SNI -> прикрытие.
 
  Проверка туннеля:  awg show $AWG_IFACE   (должен быть свежий handshake)
- Логи:              docker logs inb-haproxy ; docker logs inb-nginx
+ Проверка DNAT:     nft list table ip dhop_dnat ; systemctl status dhop-dnat
  Ссылку Telegram tg://... печатал OUTBOUND-скрипт (server=$SERVER_HOST).
 ============================================================
 EOF
@@ -1740,13 +1740,12 @@ EOF
 
     echo ""
     echo "=============================================================="
-    echo "  INBOUND ГОТОВ"
+    echo "  INBOUND ГОТОВ (L4 DNAT :443 -> telemt)"
     echo "=============================================================="
     echo ""
-    echo "  Точка входа:      $SERVER_HOST:443"
-    echo "  Легит-сайт:       https://$SERVER_HOST/   (TLS: $CERT_DESC)"
+    echo "  Точка входа:      $SERVER_HOST:443  (DNAT в туннель на telemt)"
     echo "  Туннель telemt:   $OUTBOUND_WG_IP:$TELEMT_PORT (через $AWG_IFACE)"
-    echo "  Проверка:         awg show $AWG_IFACE"
+    echo "  Проверка:         awg show $AWG_IFACE ; nft list table ip dhop_dnat"
     echo ""
     echo "  Telegram-ссылку (tg://proxy?server=$SERVER_HOST...) печатал outbound-скрипт."
     echo "  Памятка: $PANEL_INFO_FILE   Лог: $LOG_FILE"
@@ -1755,7 +1754,7 @@ fi
 echo ""
 echo "  ВАЖНО: НЕ закрывайте эту SSH-сессию, пока не проверите вход в новом окне:"
 echo "         ssh $NEW_USER@$SERVER_HOST   (root по SSH запрещён, порт $SSH_PORT/tcp открыт)"
-if [[ "$CERT_DESC" != "Let's Encrypt" ]]; then
+if [[ "$ROLE" == "outbound" && "$CERT_DESC" != "Let's Encrypt" ]]; then
     echo "         Сертификат самоподписанный — для нормального перезапустите скрипт"
     echo "         и выберите способ TLS 2 (Let's Encrypt) или 3 (Cloudflare)."
 fi
