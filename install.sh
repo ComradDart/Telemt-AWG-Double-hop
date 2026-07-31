@@ -772,6 +772,18 @@ else
         fi
     fi
 
+    # DKMS собирает amneziawg под ТЕКУЩЕЕ ядро — нужны заголовки именно под него.
+    # На свежих VPS запущено старое ядро, для которого заголовков в репозитории уже нет
+    # (есть только под новее). Тогда сборка молча падает, а дальше modprobe даёт FATAL.
+    # Ловим это заранее и даём понятную инструкцию вместо загадочной ошибки.
+    if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
+        die "Нет заголовков под текущее ядро $(uname -r) (в репозитории только под новее).
+   Обновите ядро и перезагрузитесь, затем перезапустите скрипт:
+       sudo apt-get install -y linux-image-generic linux-headers-generic
+       sudo reboot
+   После ребута снова: sudo bash install.sh"
+    fi
+
     # Подключаем PPA amnezia/ppa
     if ls /etc/apt/sources.list.d/ 2>/dev/null | grep -qi amnezia; then
         skip "Репозиторий Amnezia уже подключён"
