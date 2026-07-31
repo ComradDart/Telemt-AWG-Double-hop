@@ -845,16 +845,44 @@ EOF
     fi
 
     apt-get update
-    log "Устанавливаю пакет amneziawg (сборка DKMS может занять пару минут)"
-    apt-get install -y amneziawg
+    # amneziawg-tools (userspace awg/awg-quick) — нужны host'у для awg0-клиента на inbound.
+    apt_install amneziawg-tools
+
+    # ВАЖНО: НЕ ставим свежий amneziawg-dkms из PPA. С 2026-07-30 там модуль AWG v3.0,
+    # который ЛОМАЕТ wg-easy 15.3.0 (netlink 'awg' attribute type 14 has invalid length ->
+    # awg setconf Invalid argument -> интерфейс не поднимается ДАЖЕ на чистой установке;
+    # ни одна веб-панель AWG 3.0 пока не поддерживает). Пиним последний pre-3.0 модуль и
+    # собираем его через DKMS из git.
+    AWG_MOD_TAG="v1.0.20260725"          # при неудаче сборки на новом ядре -> v1.0.20260322
+    AWG_MOD_VER="${AWG_MOD_TAG#v}"
+    apt-get remove -y amneziawg-dkms >/dev/null 2>&1 || true
+    apt-mark hold amneziawg amneziawg-dkms >/dev/null 2>&1 || true
+    if dkms status 2>/dev/null | grep -q "amneziawg/${AWG_MOD_VER}, $(uname -r).*installed"; then
+        skip "Модуль amneziawg $AWG_MOD_VER уже собран для $(uname -r)"
+    else
+        apt_install git dkms build-essential
+        AWG_SRC="/usr/src/amneziawg-$AWG_MOD_VER"
+        rm -rf /tmp/awg-km "$AWG_SRC"
+        log "Собираю модуль amneziawg $AWG_MOD_VER из git (v3.0 из PPA несовместим с wg-easy)"
+        git clone --depth 1 --branch "$AWG_MOD_TAG" \
+            https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git /tmp/awg-km \
+            || die "Не удалось склонировать amneziawg $AWG_MOD_TAG"
+        cp -r /tmp/awg-km/src "$AWG_SRC"
+        sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$AWG_MOD_VER\"/" "$AWG_SRC/dkms.conf"
+        dkms add -m amneziawg -v "$AWG_MOD_VER" 2>/dev/null || true
+        dkms build -m amneziawg -v "$AWG_MOD_VER" \
+            || die "Сборка модуля amneziawg $AWG_MOD_VER не удалась (проверьте linux-headers-\$(uname -r); можно тег v1.0.20260322)."
+        dkms install --force -m amneziawg -v "$AWG_MOD_VER" \
+            || die "Установка модуля amneziawg $AWG_MOD_VER не удалась (dkms status)."
+        rm -rf /tmp/awg-km
+    fi
 fi
 
-if lsmod | grep -qw amneziawg; then
-    skip "Модуль amneziawg уже загружен"
-else
-    log "Загружаю модуль amneziawg"
-    modprobe amneziawg || die "Не удалось загрузить модуль amneziawg. Проверьте сборку DKMS: dkms status"
-fi
+# Перезагружаем модуль на всякий случай (мог быть загружен сломанный v3.0). modprobe -r
+# не сработает, если интерфейс уже поднят — тогда просто оставляем текущий.
+modprobe -r amneziawg 2>/dev/null || true
+log "Загружаю модуль amneziawg"
+modprobe amneziawg || die "Не удалось загрузить модуль amneziawg. Проверьте сборку DKMS: dkms status"
 
 # Автозагрузка модуля после перезагрузки
 deploy_file /etc/modules-load.d/amneziawg.conf 644 <<EOF >/dev/null || true
