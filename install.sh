@@ -1573,11 +1573,14 @@ net.ipv4.ip_forward=1
 EOF
 sysctl -p /etc/sysctl.d/99-dhop-forward.conf >/dev/null 2>&1 || true
 
-# ufw по умолчанию DROP'ает форвардинг — разрешаем (бокс работает шлюзом к telemt).
-if [[ -f /etc/default/ufw ]] && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw; then
-    sed -i 's/^DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-    ufw reload >/dev/null 2>&1 || true
-    log "ufw: форвардинг разрешён (DEFAULT_FORWARD_POLICY=ACCEPT)"
+# ufw по умолчанию DROP'ает форвардинг. НЕ открываем его глобально — разрешаем
+# форвардинг ТОЛЬКО на telemt в туннеле (ufw route). Обратный трафик проходит по
+# established/related (ufw принимает его в forward-цепочке автоматически).
+# DEFAULT_FORWARD_POLICY остаётся DROP — узкая, а не глобальная дырка.
+if ufw route allow proto tcp to "$OUTBOUND_WG_IP" port "$TELEMT_PORT" >/dev/null 2>&1; then
+    log "ufw: разрешён форвардинг :443 -> $OUTBOUND_WG_IP:$TELEMT_PORT (глобальный forward остаётся DROP)"
+else
+    warn "ufw route allow не сработал — если клиенты не подключаются, проверьте форвардинг ufw"
 fi
 
 # nftables DNAT+masquerade (персистентно через systemd-юнит)
