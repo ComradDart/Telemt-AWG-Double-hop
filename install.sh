@@ -822,27 +822,22 @@ EOF
         exit 0
     fi
 
-    # amneziawg-tools (userspace awg/awg-quick) нужны host'у ТОЛЬКО на INBOUND (для awg0-клиента).
-    # На OUTBOUND их использует wg-easy ВНУТРИ контейнера — host'у они не нужны, поэтому PPA там
-    # вообще не трогаем (add-apt-repository лезет в нестабильный Launchpad-API и падал с
-    # IncompleteRead). Сам модуль в обеих ролях собираем из git ниже — PPA для него не нужен.
-    if [[ "$ROLE" == "inbound" ]]; then
-        if ! ls /etc/apt/sources.list.d/ 2>/dev/null | grep -qi amnezia; then
-            log "Подключаю PPA amnezia/ppa вручную (без add-apt-repository) для amneziawg-tools"
-            KEYRING=/usr/share/keyrings/amnezia-ppa.gpg
-            if [[ ! -s "$KEYRING" ]]; then
-                GPG_TMP=$(mktemp -d)
-                gpg --homedir "$GPG_TMP" --keyserver hkps://keyserver.ubuntu.com --recv-keys "$AMNEZIA_KEY_FPR" \
-                    || die "Не удалось получить GPG-ключ Amnezia PPA (сеть?) — повторите запуск."
-                gpg --homedir "$GPG_TMP" --export "$AMNEZIA_KEY_FPR" > "$KEYRING"
-                rm -rf "$GPG_TMP"
-            fi
-            cat > /etc/apt/sources.list.d/amnezia-ppa.list <<EOF
-deb [signed-by=$KEYRING] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
-EOF
-        fi
-        apt-get update
-        apt_install amneziawg-tools
+    # amneziawg-tools (host awg/awg-quick) нужны ТОЛЬКО на INBOUND (для awg0-клиента к outbound).
+    # На OUTBOUND их использует wg-easy ВНУТРИ контейнера. НЕ ставим из PPA: с 2026-07-30 там
+    # тулзы v3.0.20260730 (новый netlink attr 14), несовместимые с нашим v1.0-модулем — awg-quick
+    # падал бы с 'attribute type 14 invalid length'. Собираем последние v1.0-тулзы из git
+    # (make && make install, ставит awg/awg-quick в /usr/bin + systemd-юнит awg-quick@).
+    if [[ "$ROLE" == "inbound" ]] && ! command -v awg-quick >/dev/null 2>&1; then
+        AWG_TOOLS_TAG="v1.0.20260618-2"
+        apt_install git build-essential
+        rm -rf /tmp/awg-tools
+        log "Собираю amneziawg-tools $AWG_TOOLS_TAG из git (v1.0, совместимы с v1.0-модулем)"
+        git clone --depth 1 --branch "$AWG_TOOLS_TAG" \
+            https://github.com/amnezia-vpn/amneziawg-tools.git /tmp/awg-tools \
+            || die "Не удалось склонировать amneziawg-tools $AWG_TOOLS_TAG"
+        make -C /tmp/awg-tools/src || die "Сборка amneziawg-tools не удалась"
+        make -C /tmp/awg-tools/src install || die "Установка amneziawg-tools не удалась (make install)"
+        rm -rf /tmp/awg-tools
     fi
 
     # ВАЖНО: НЕ ставим свежий amneziawg-dkms из PPA. С 2026-07-30 там модуль AWG v3.0,
