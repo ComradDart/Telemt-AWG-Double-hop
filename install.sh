@@ -822,31 +822,28 @@ EOF
         exit 0
     fi
 
-    # Подключаем PPA amnezia/ppa
-    if ls /etc/apt/sources.list.d/ 2>/dev/null | grep -qi amnezia; then
-        skip "Репозиторий Amnezia уже подключён"
-    elif [[ "$OS_ID" == "ubuntu" ]]; then
-        log "Подключаю PPA amnezia/ppa (Ubuntu)"
-        apt_install software-properties-common python3-launchpadlib
-        add-apt-repository -y ppa:amnezia/ppa
-    else
-        log "Подключаю PPA amnezia/ppa (Debian, вручную)"
-        KEYRING=/usr/share/keyrings/amnezia-ppa.gpg
-        if [[ ! -s "$KEYRING" ]]; then
-            GPG_TMP=$(mktemp -d)
-            gpg --homedir "$GPG_TMP" --keyserver hkps://keyserver.ubuntu.com --recv-keys "$AMNEZIA_KEY_FPR"
-            gpg --homedir "$GPG_TMP" --export "$AMNEZIA_KEY_FPR" > "$KEYRING"
-            rm -rf "$GPG_TMP"
-        fi
-        cat > /etc/apt/sources.list.d/amnezia-ppa.list <<EOF
+    # amneziawg-tools (userspace awg/awg-quick) нужны host'у ТОЛЬКО на INBOUND (для awg0-клиента).
+    # На OUTBOUND их использует wg-easy ВНУТРИ контейнера — host'у они не нужны, поэтому PPA там
+    # вообще не трогаем (add-apt-repository лезет в нестабильный Launchpad-API и падал с
+    # IncompleteRead). Сам модуль в обеих ролях собираем из git ниже — PPA для него не нужен.
+    if [[ "$ROLE" == "inbound" ]]; then
+        if ! ls /etc/apt/sources.list.d/ 2>/dev/null | grep -qi amnezia; then
+            log "Подключаю PPA amnezia/ppa вручную (без add-apt-repository) для amneziawg-tools"
+            KEYRING=/usr/share/keyrings/amnezia-ppa.gpg
+            if [[ ! -s "$KEYRING" ]]; then
+                GPG_TMP=$(mktemp -d)
+                gpg --homedir "$GPG_TMP" --keyserver hkps://keyserver.ubuntu.com --recv-keys "$AMNEZIA_KEY_FPR" \
+                    || die "Не удалось получить GPG-ключ Amnezia PPA (сеть?) — повторите запуск."
+                gpg --homedir "$GPG_TMP" --export "$AMNEZIA_KEY_FPR" > "$KEYRING"
+                rm -rf "$GPG_TMP"
+            fi
+            cat > /etc/apt/sources.list.d/amnezia-ppa.list <<EOF
 deb [signed-by=$KEYRING] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
-deb-src [signed-by=$KEYRING] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
 EOF
+        fi
+        apt-get update
+        apt_install amneziawg-tools
     fi
-
-    apt-get update
-    # amneziawg-tools (userspace awg/awg-quick) — нужны host'у для awg0-клиента на inbound.
-    apt_install amneziawg-tools
 
     # ВАЖНО: НЕ ставим свежий amneziawg-dkms из PPA. С 2026-07-30 там модуль AWG v3.0,
     # который ЛОМАЕТ wg-easy 15.3.0 (netlink 'awg' attribute type 14 has invalid length ->
