@@ -1236,7 +1236,10 @@ fi
 # Восстанавливаем ТОЛЬКО в пустой volume, чтобы никогда не затереть рабочие данные.
 WG_BACKUP="/root/dhop-backup.tar.gz"
 if [[ -f "$WG_BACKUP" ]]; then
-    WG_VOL=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '_etc_wireguard$' | head -1)
+    # `|| true`: на свежем сервере volume'ов ещё нет -> grep не находит совпадений и
+    # выходит с кодом 1, что при set -e/pipefail роняло скрипт. Пустой результат ок —
+    # ниже подставляется дефолтное имя.
+    WG_VOL=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '_etc_wireguard$' | head -1 || true)
     WG_VOL="${WG_VOL:-wg-easy_etc_wireguard}"
     VOL_CONTENT=""
     docker volume inspect "$WG_VOL" >/dev/null 2>&1 && \
@@ -1245,18 +1248,23 @@ if [[ -f "$WG_BACKUP" ]]; then
         log "Найден бэкап $WG_BACKUP — восстанавливаю AWG-клиентов в volume $WG_VOL"
         docker volume create "$WG_VOL" >/dev/null 2>&1 || true
         TMP_R=$(mktemp -d)
-        tar xzf "$WG_BACKUP" -C "$TMP_R"
-        if [[ -f "$TMP_R/dhop-backup/etc_wireguard.tar.gz" ]]; then
-            docker run --rm -v "$WG_VOL":/d -v "$TMP_R/dhop-backup":/b:ro alpine \
-                sh -c 'tar xzf /b/etc_wireguard.tar.gz -C /d' \
-                && log "Клиенты wg-easy восстановлены из бэкапа (INIT wg-easy не сработает — volume не пуст)"
+        # Всё в if/||, чтобы битый бэкап не ронял весь install (set -e).
+        if ! tar xzf "$WG_BACKUP" -C "$TMP_R" 2>/dev/null; then
+            warn "Не удалось распаковать $WG_BACKUP — пропускаю восстановление (клиентов придётся создать заново)"
+        elif [[ -f "$TMP_R/dhop-backup/etc_wireguard.tar.gz" ]]; then
+            if docker run --rm -v "$WG_VOL":/d -v "$TMP_R/dhop-backup":/b:ro alpine \
+                   sh -c 'tar xzf /b/etc_wireguard.tar.gz -C /d'; then
+                log "Клиенты wg-easy восстановлены из бэкапа (INIT не сработает — volume не пуст)"
+            else
+                warn "Не удалось распаковать etc_wireguard.tar.gz в volume — проверьте бэкап"
+            fi
+            # Секреты прошлого сервера — если своих ещё нет (сохранит пути панели/секрет telemt)
+            if [[ -f "$TMP_R/dhop-backup/secrets.env" && ! -s "$SECRETS_FILE" ]]; then
+                cp "$TMP_R/dhop-backup/secrets.env" "$SECRETS_FILE" && chmod 600 "$SECRETS_FILE" \
+                    && log "Секреты восстановлены из бэкапа ($SECRETS_FILE)"
+            fi
         else
             warn "В бэкапе нет dhop-backup/etc_wireguard.tar.gz — восстановление пропущено"
-        fi
-        # Секреты прошлого сервера — если своих ещё нет (сохранит пути панели/секрет telemt)
-        if [[ -f "$TMP_R/dhop-backup/secrets.env" && ! -s "$SECRETS_FILE" ]]; then
-            cp "$TMP_R/dhop-backup/secrets.env" "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"
-            log "Секреты восстановлены из бэкапа ($SECRETS_FILE)"
         fi
         rm -rf "$TMP_R"
     else
