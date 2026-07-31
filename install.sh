@@ -572,6 +572,10 @@ deploy_file /etc/apt/apt.conf.d/99-dhop-lock-timeout 644 <<'EOF' >/dev/null || t
 DPkg::Lock::Timeout "300";
 Acquire::Retries "3";
 EOF
+# Чиним прерванный dpkg от возможного прошлого падения
+# (E: dpkg was interrupted, you must manually run 'dpkg --configure -a').
+# Идемпотентно: на чистой системе ничего не делает.
+dpkg --configure -a 2>/dev/null || true
 apt-get update
 apt_install curl ca-certificates gnupg openssl sudo ufw fail2ban
 
