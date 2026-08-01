@@ -880,6 +880,39 @@ if [[ "$ROLE" == "inbound" ]] && ! command -v awg-quick >/dev/null 2>&1; then
 fi
 
 # ==============================================================================
+# ШАГ 6.5. Сетевой тюнинг (обе роли) — стабильность хендшейков и медиа
+# ==============================================================================
+# По ресёрчу MEKO/MTproxy-reanimation + telemt HIGH_LOAD. ВАЖНО: per-IP SYN-лимиты из
+# этих тулз в double-hop ВРЕДНЫ (telemt видит один masqueraded IP inbound -> зарежет всех),
+# поэтому их НЕ берём. Берём безопасное и полезное:
+#  - BBR+fq: терпимость к потерям на throttl'ящей клиентской ноге и в туннеле;
+#  - tcp_mtu_probing=1 (PLPMTUD): чинит блэкхол больших медиа-пакетов в туннеле без опоры
+#    на ICMP (частая причина «медиа то грузится, то нет»); безопаснее статичного MSS-клампа;
+#  - короткий keepalive: быстрее подчищает мёртвые сокеты (iOS уходит в фон);
+#  - буферы: сглаживают mid-stream паузы и медиа-throughput.
+log "--- Шаг 6.5: сетевой тюнинг (BBR/fq, MTU probing, keepalive, буферы) ---"
+deploy_file /etc/sysctl.d/99-dhop-tuning.conf 644 <<'EOF' >/dev/null || true
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 3
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+fs.file-max = 2097152
+EOF
+modprobe tcp_bbr 2>/dev/null || true
+sysctl -p /etc/sysctl.d/99-dhop-tuning.conf >/dev/null 2>&1 || true
+if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+    log "Тюнинг применён (BBR активен)"
+else
+    warn "BBR не активировался (модуль tcp_bbr?) — остальной тюнинг применён"
+fi
+
+# ==============================================================================
 # ШАГ 7. Docker (ТОЛЬКО outbound — весь его стек в контейнерах)
 # ==============================================================================
 # Inbound в R1 не запускает контейнеров (только nftables-DNAT), а dockerd ещё и вставляет
@@ -1515,9 +1548,12 @@ ipv4   = true
 ipv6   = false
 prefer = 4
 
-# Таймауты (по мотивам MTproxy-reanimation) — помогают против «handshake timeout»
+# Таймауты. client_handshake — сколько ждать первый байт хендшейка ОТ КЛИЕНТА (не от
+# Telegram!). На РФ-сетях хендшейк реально доходит за 15-19с (telemt #461), поэтому 15
+# резало живые медленные соединения -> «Telegram handshake timeout». Дефолт 30 (+0.75с при
+# mask). Ставим 30; на совсем злых операторах можно 45.
 [timeouts]
-client_handshake = 15
+client_handshake = 30
 client_keepalive = 60
 
 [server]
