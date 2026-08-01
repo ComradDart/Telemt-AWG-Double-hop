@@ -50,6 +50,36 @@ wg-easy и вы захотите на неё перейти — впишите �
 4. **INBOUND:** AmneziaWG-клиент (`awg0`) к outbound + nftables-DNAT `:443` → telemt через туннель (persist —
    `dhop-dnat.service`).
 
+## Два домена: что куда указывает
+
+В double-hop два сервера, и у каждого свой домен. Легко перепутать, какая A-запись куда смотрит — вот схема
+(для примера: `out.example.com` = outbound, `in.example.com` = inbound):
+
+| Имя | A-запись → | Роль |
+|---|---|---|
+| **outbound-домен** `out.example.com` | IP **outbound** | Панель wg-easy (`https://out.example.com/<секрет>`), LE-серт, легит-сайт. **Клиенты сюда НЕ ходят.** |
+| **inbound-домен** `in.example.com` | IP **inbound** | Точка входа: в `tg://`-ссылке `server=in.example.com`. **Клиенты подключаются сюда.** |
+| **маска / SNI** `cdn.in.example.com` | IP **inbound** | SNI, который клиент шлёт в fake-TLS (зашит в секрет ссылки). Указывает на inbound → SNI совпадает с IP подключения. |
+
+Правила, которые всё расставляют по местам:
+
+- **Клиенты подключаются только к inbound** (`server=` в ссылке). Outbound спрятан за туннелем и снаружи недоступен —
+  его домен нужен лишь для панели и (при self-mask) для легитимного сертификата.
+- **Маска (SNI) должна резолвиться в inbound-IP**, а не в outbound и не в «чужой» домен. Тогда проверка «SNI = тот же IP,
+  куда подключился клиент» сходится и не палит связку. Проще всего — сабдомен inbound-домена (`cdn.in.example.com`).
+- Маску и inbound-домен можно сделать **одинаковыми** (`server=` = SNI = `in.example.com`) или **разными** — важно лишь,
+  чтобы SNI указывал на inbound-IP. Отдельный `cdn.`-сабдомен удобен тем, что его никто не открывает в браузере
+  (fake-TLS даёт неродной серт — на `cdn.`-имени это никого не смущает).
+
+Пример настройки DNS и ссылки:
+```
+out.example.com      A  <IP outbound>     # панель/серт, клиенты не ходят
+in.example.com       A  <IP inbound>      # server= в ссылке
+cdn.in.example.com   A  <IP inbound>      # маска (SNI)
+
+tg://proxy?server=in.example.com&port=443&secret=ee<секрет><hex(cdn.in.example.com)>
+```
+
 ## Порядок развёртывания
 
 1. **OUTBOUND** (`роль = outbound`, включить telemt). В конце печатает WG-IP telemt (`10.8.0.1`), порт, маску, секрет,
@@ -80,7 +110,8 @@ wg-easy и вы захотите на неё перейти — впишите �
 
 **Медиа/iOS:** быстрая загрузка обеспечивается telemt-опцией `client_mss_bulk` (низкий MSS `client_mss="tspu"` только
 на TLS-handshake для обхода DPI, нормальный — на payload). В R1 это работает, т.к. telemt сам терминирует клиента.
-Внешние iptables-патчи (MEKO/MTproxy-reanimation) при этом не нужны.
+Их SYN-часть в личной связке избыточна, но **sysctl-тюнинг из MEKO/MTproxy-reanimation (BBR/fq + короткий keepalive)
+может улучшить стабильность медиа через туннель** — оценивается отдельно.
 
 ## Требования
 
