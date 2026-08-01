@@ -1,7 +1,7 @@
 # Telemt-AWG-Double-hop
 
 Интерактивный скрипт для быстрой настройки **double-hop прокси Telegram на [telemt](https://github.com/telemt/telemt)**
-(MTProto-форк) поверх туннеля **AmneziaWG**. Один и тот же скрипт настраивает оба сервера — зарубежный
+поверх туннеля **AmneziaWG**. Один и тот же скрипт настраивает оба сервера — зарубежный
 **outbound** (выход к Telegram) и российский **inbound** (точка входа) — с базовой защитой VPS.
 
 Заодно outbound работает как обычный **AmneziaWG-VPN** с веб-панелью [wg-easy](https://github.com/wg-easy/wg-easy).
