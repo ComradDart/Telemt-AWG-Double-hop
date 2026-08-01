@@ -542,6 +542,12 @@ else
             AWG_PASTE+="$line"$'\n'
         done
         [[ -n "$AWG_PASTE" ]] || die "Пустой AmneziaWG-конфиг — повторите запуск и вставьте конфиг клиента."
+        # Пишем конфиг на диск СРАЗУ: дальше Шаг 6 может обновить ядро и уйти в reboot, а
+        # неинтерактивный resume (`yes ""`) уже не сможет ввести вставку заново. Файл переживёт
+        # ребут, и повторный проход увидит его через проверку `-s ...conf` выше и пропустит вставку.
+        mkdir -p "$AWG_CONF_DIR"; chmod 700 "$AWG_CONF_DIR"
+        printf '%s' "$AWG_PASTE" > "$AWG_CONF_DIR/$AWG_IFACE.conf"
+        chmod 600 "$AWG_CONF_DIR/$AWG_IFACE.conf"
     fi
 fi
 
