@@ -55,8 +55,6 @@ INB_SITE_TLS_PORT="8443"                 # nginx-TLS легит-сайта (за
 
 SSHD_DROPIN="/etc/ssh/sshd_config.d/99-vps-setup.conf"
 
-AMNEZIA_KEY_FPR="75C9DD72C799870E310542E24166F2C257290828"
-
 export DEBIAN_FRONTEND=noninteractive
 
 # ------------------------------------------------------------------------------
@@ -375,43 +373,47 @@ while true; do
     echo "  Похоже на опечатку или кириллицу. Допустимы латиница, цифры, точки, дефис."
 done
 
-# --- Способ получения TLS-сертификата ---
-echo ""
-echo "TLS-сертификат для https://$SERVER_HOST/<секретный путь>:"
-echo "  1) Самоподписанный — быстро, но браузер будет показывать предупреждение"
-echo "  2) Let's Encrypt (HTTP-01) — нужен ДОМЕН с A-записью на этот сервер и открытый порт 80"
-echo "  3) Let's Encrypt (Cloudflare DNS-01) — нужен API-токен Cloudflare; работает даже за оранжевым облаком CF"
-DEF_CERT="${CERT_MODE:-1}"
-while true; do
-    read -rp "Вариант [1/2/3] [${DEF_CERT}]: " CERT_MODE
-    CERT_MODE="${CERT_MODE:-$DEF_CERT}"
-    case "$CERT_MODE" in 1|2|3) break ;; *) echo "  Введите 1, 2 или 3." ;; esac
-done
-
+# --- Способ получения TLS-сертификата (ТОЛЬКО outbound; inbound не терминирует TLS в R1) ---
 LE_EMAIL="${LE_EMAIL:-}"
 CF_TOKEN=""
-if [[ "$CERT_MODE" == "2" || "$CERT_MODE" == "3" ]]; then
-    if [[ "$SERVER_HOST" =~ ^[0-9.]+$ ]]; then
-        warn "Let's Encrypt не выдаёт сертификаты на IP-адрес ($SERVER_HOST). Переключаюсь на самоподписанный."
-        CERT_MODE=1
-    else
-        DEF_EMAIL="${LE_EMAIL:-admin@$SERVER_HOST}"
-        read -rp "E-mail для уведомлений Let's Encrypt [${DEF_EMAIL}]: " LE_EMAIL
-        LE_EMAIL="${LE_EMAIL:-$DEF_EMAIL}"
-    fi
-fi
+if [[ "$ROLE" == "outbound" ]]; then
+    echo ""
+    echo "TLS-сертификат для https://$SERVER_HOST/<секретный путь>:"
+    echo "  1) Самоподписанный — быстро, но браузер будет показывать предупреждение"
+    echo "  2) Let's Encrypt (HTTP-01) — нужен ДОМЕН с A-записью на этот сервер и открытый порт 80"
+    echo "  3) Let's Encrypt (Cloudflare DNS-01) — нужен API-токен Cloudflare; работает даже за оранжевым облаком CF"
+    DEF_CERT="${CERT_MODE:-1}"
+    while true; do
+        read -rp "Вариант [1/2/3] [${DEF_CERT}]: " CERT_MODE
+        CERT_MODE="${CERT_MODE:-$DEF_CERT}"
+        case "$CERT_MODE" in 1|2|3) break ;; *) echo "  Введите 1, 2 или 3." ;; esac
+    done
 
-if [[ "$CERT_MODE" == "3" ]]; then
-    if [[ -s "$CF_CREDS_FILE" ]]; then
-        skip "API-токен Cloudflare уже сохранён ($CF_CREDS_FILE) — использую существующий"
-    else
-        echo "  Токен создаётся в Cloudflare: My Profile -> API Tokens -> шаблон \"Edit zone DNS\"."
-        while true; do
-            read -rsp "  API-токен Cloudflare (ввод скрыт): " CF_TOKEN; echo ""
-            [[ -n "$CF_TOKEN" ]] && break
-            echo "  Токен не может быть пустым."
-        done
+    if [[ "$CERT_MODE" == "2" || "$CERT_MODE" == "3" ]]; then
+        if [[ "$SERVER_HOST" =~ ^[0-9.]+$ ]]; then
+            warn "Let's Encrypt не выдаёт сертификаты на IP-адрес ($SERVER_HOST). Переключаюсь на самоподписанный."
+            CERT_MODE=1
+        else
+            DEF_EMAIL="${LE_EMAIL:-admin@$SERVER_HOST}"
+            read -rp "E-mail для уведомлений Let's Encrypt [${DEF_EMAIL}]: " LE_EMAIL
+            LE_EMAIL="${LE_EMAIL:-$DEF_EMAIL}"
+        fi
     fi
+
+    if [[ "$CERT_MODE" == "3" ]]; then
+        if [[ -s "$CF_CREDS_FILE" ]]; then
+            skip "API-токен Cloudflare уже сохранён ($CF_CREDS_FILE) — использую существующий"
+        else
+            echo "  Токен создаётся в Cloudflare: My Profile -> API Tokens -> шаблон \"Edit zone DNS\"."
+            while true; do
+                read -rsp "  API-токен Cloudflare (ввод скрыт): " CF_TOKEN; echo ""
+                [[ -n "$CF_TOKEN" ]] && break
+                echo "  Токен не может быть пустым."
+            done
+        fi
+    fi
+else
+    CERT_MODE="${CERT_MODE:-1}"   # inbound: значение не используется (нет TLS-терминации)
 fi
 
 # --- fail2ban whitelist (защита от самобана; важно при динамическом IP) ---
@@ -521,12 +523,6 @@ else
     done
     read -rp "Порт telemt внутри туннеля [${TELEMT_PORT}]: " v
     TELEMT_PORT="${v:-$TELEMT_PORT}"
-
-    # SYN rate-limit: полезен для ПУБЛИЧНЫХ прокси под зондированием, но режет
-    # параллельную загрузку медиа у обычных клиентов. Для личной связки — выкл.
-    [[ "$SYN_RATELIMIT" == "yes" ]] && DEF_SRL="y" || DEF_SRL="N"
-    read -rp "Включить анти-DPI SYN rate-limit на :443 (может тормозить медиа Telegram)? [y/N] [${DEF_SRL}]: " v
-    case "$v" in y|Y|yes|YES|да|on|1|true) SYN_RATELIMIT=yes ;; *) SYN_RATELIMIT=no ;; esac
 
     if [[ -s "$AWG_CONF_DIR/$AWG_IFACE.conf" ]]; then
         skip "AmneziaWG-конфиг клиента уже есть ($AWG_CONF_DIR/$AWG_IFACE.conf) — переиспользую"
@@ -763,16 +759,6 @@ log "--- Шаг 6: модуль ядра AmneziaWG ---"
 if modinfo amneziawg >/dev/null 2>&1; then
     skip "Модуль amneziawg уже установлен"
 else
-    log "Включаю deb-src репозитории (нужны для сборки модуля)"
-    if [[ -f /etc/apt/sources.list ]]; then
-        sed -i -E 's/^#\s*(deb-src\s)/\1/' /etc/apt/sources.list
-    fi
-    shopt -s nullglob
-    for f in /etc/apt/sources.list.d/*.sources; do
-        sed -i 's/^Types: deb$/Types: deb deb-src/' "$f"
-    done
-    shopt -u nullglob
-
     log "Устанавливаю заголовки ядра"
     if ! apt_install "linux-headers-$(uname -r)"; then
         warn "Пакет linux-headers-$(uname -r) недоступен, пробую generic-вариант"
@@ -795,7 +781,11 @@ else
         fi
         warn "Нет заголовков под текущее ядро $(uname -r). Обновляю ядро и ПЕРЕЗАГРУЖАЮСЬ —"
         warn "после ребута установка ПРОДОЛЖИТСЯ САМА (отвечать на вопросы заново не нужно)."
-        apt_install linux-image-generic linux-headers-generic
+        if [[ "$OS_ID" == "ubuntu" ]]; then
+            apt_install linux-image-generic linux-headers-generic
+        else
+            apt_install linux-image-amd64 linux-headers-amd64
+        fi
         touch "$STATE_DIR/kernel-upgraded"
 
         # Копируем скрипт в стабильное место и ставим одноразовый systemd-юнит: после ребута
@@ -826,24 +816,6 @@ EOF
         sleep 5
         reboot
         exit 0
-    fi
-
-    # amneziawg-tools (host awg/awg-quick) нужны ТОЛЬКО на INBOUND (для awg0-клиента к outbound).
-    # На OUTBOUND их использует wg-easy ВНУТРИ контейнера. НЕ ставим из PPA: с 2026-07-30 там
-    # тулзы v3.0.20260730 (новый netlink attr 14), несовместимые с нашим v1.0-модулем — awg-quick
-    # падал бы с 'attribute type 14 invalid length'. Собираем последние v1.0-тулзы из git
-    # (make && make install, ставит awg/awg-quick в /usr/bin + systemd-юнит awg-quick@).
-    if [[ "$ROLE" == "inbound" ]] && ! command -v awg-quick >/dev/null 2>&1; then
-        AWG_TOOLS_TAG="v1.0.20260618-2"
-        apt_install git build-essential
-        rm -rf /tmp/awg-tools
-        log "Собираю amneziawg-tools $AWG_TOOLS_TAG из git (v1.0, совместимы с v1.0-модулем)"
-        git clone --depth 1 --branch "$AWG_TOOLS_TAG" \
-            https://github.com/amnezia-vpn/amneziawg-tools.git /tmp/awg-tools \
-            || die "Не удалось склонировать amneziawg-tools $AWG_TOOLS_TAG"
-        make -C /tmp/awg-tools/src || die "Сборка amneziawg-tools не удалась"
-        make -C /tmp/awg-tools/src install || die "Установка amneziawg-tools не удалась (make install)"
-        rm -rf /tmp/awg-tools
     fi
 
     # ВАЖНО: НЕ ставим свежий amneziawg-dkms из PPA. С 2026-07-30 там модуль AWG v3.0,
@@ -888,9 +860,32 @@ amneziawg
 EOF
 log "Модуль amneziawg установлен и загружен"
 
+# amneziawg-tools (host awg/awg-quick) нужны ТОЛЬКО на INBOUND (для awg0-клиента к outbound).
+# На OUTBOUND их использует wg-easy ВНУТРИ контейнера. НЕ ставим из PPA: с 2026-07-30 там тулзы
+# v3.0.20260730 (новый netlink attr 14), несовместимые с v1.0-модулем — awg-quick падал бы с
+# 'attribute type 14 invalid length'. Собираем последние v1.0-тулзы из git (make && make install:
+# awg/awg-quick в /usr/bin + systemd-юнит awg-quick@). Вне блока модуля выше — тулзы и модуль
+# независимы (модуль мог уже стоять, а тулз ещё нет).
+if [[ "$ROLE" == "inbound" ]] && ! command -v awg-quick >/dev/null 2>&1; then
+    AWG_TOOLS_TAG="v1.0.20260618-2"
+    apt_install git build-essential
+    rm -rf /tmp/awg-tools
+    log "Собираю amneziawg-tools $AWG_TOOLS_TAG из git (v1.0, совместимы с v1.0-модулем)"
+    git clone --depth 1 --branch "$AWG_TOOLS_TAG" \
+        https://github.com/amnezia-vpn/amneziawg-tools.git /tmp/awg-tools \
+        || die "Не удалось склонировать amneziawg-tools $AWG_TOOLS_TAG"
+    make -C /tmp/awg-tools/src || die "Сборка amneziawg-tools не удалась"
+    make -C /tmp/awg-tools/src install || die "Установка amneziawg-tools не удалась (make install)"
+    rm -rf /tmp/awg-tools
+fi
+
 # ==============================================================================
-# ШАГ 7. Docker
+# ШАГ 7. Docker (ТОЛЬКО outbound — весь его стек в контейнерах)
 # ==============================================================================
+# Inbound в R1 не запускает контейнеров (только nftables-DNAT), а dockerd ещё и вставляет
+# свои DOCKER-USER/isolation-правила в FORWARD-цепочку, от которой зависит наш форвардинг —
+# так что на inbound Docker не ставим вовсе.
+if [[ "$ROLE" == "outbound" ]]; then
 log "--- Шаг 7: Docker ---"
 
 if command -v docker >/dev/null 2>&1; then
@@ -910,6 +905,7 @@ fi
 
 systemctl enable --now docker >/dev/null 2>&1 || true
 log "Docker готов"
+fi
 
 # ==============================================================================
 # ШАГ 8. Секреты (путь панели, cookie-токен, пароль админа)
